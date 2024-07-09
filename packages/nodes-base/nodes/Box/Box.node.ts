@@ -7,15 +7,13 @@ import type {
 } from 'n8n-workflow';
 import { NodeOperationError } from 'n8n-workflow';
 
+import moment from 'moment-timezone';
+import { noCase } from 'change-case';
 import { boxApiRequest, boxApiRequestAllItems } from './GenericFunctions';
 
 import { fileFields, fileOperations } from './FileDescription';
 
 import { folderFields, folderOperations } from './FolderDescription';
-
-import moment from 'moment-timezone';
-
-import { noCase } from 'change-case';
 
 export class Box implements INodeType {
 	description: INodeTypeDescription = {
@@ -512,7 +510,7 @@ export class Box implements INodeType {
 				);
 				returnData.push(...executionData);
 			} catch (error) {
-				if (this.continueOnFail()) {
+				if (this.continueOnFail(error)) {
 					const executionErrorData = this.helpers.constructExecutionMetaData(
 						this.helpers.returnJsonArray({ error: error.message }),
 						{ itemData: { item: i } },

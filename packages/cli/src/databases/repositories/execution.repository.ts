@@ -1,15 +1,32 @@
 import { Service } from 'typedi';
-import { Brackets, DataSource, In, LessThanOrEqual, MoreThanOrEqual, Repository } from 'typeorm';
-import { DateUtils } from 'typeorm/util/DateUtils';
+import {
+	Brackets,
+	DataSource,
+	In,
+	IsNull,
+	LessThan,
+	LessThanOrEqual,
+	MoreThanOrEqual,
+	Not,
+	Raw,
+	Repository,
+} from '@n8n/typeorm';
+import { DateUtils } from '@n8n/typeorm/util/DateUtils';
 import type {
 	FindManyOptions,
 	FindOneOptions,
+	FindOperator,
 	FindOptionsWhere,
 	SelectQueryBuilder,
-} from 'typeorm';
+} from '@n8n/typeorm';
 import { parse, stringify } from 'flatted';
-import { LoggerProxy as Logger } from 'n8n-workflow';
-import type { IExecutionsSummary, IRunExecutionData } from 'n8n-workflow';
+import {
+	ApplicationError,
+	WorkflowOperationError,
+	type ExecutionStatus,
+	type ExecutionSummary,
+	type IRunExecutionData,
+} from 'n8n-workflow';
 import { BinaryDataService } from 'n8n-core';
 import type {
 	ExecutionPayload,
@@ -19,13 +36,30 @@ import type {
 } from '@/Interfaces';
 
 import config from '@/config';
-import type { IGetExecutionsQueryFilter } from '@/executions/executions.service';
-import { isAdvancedExecutionFiltersEnabled } from '@/executions/executionHelpers';
 import type { ExecutionData } from '../entities/ExecutionData';
 import { ExecutionEntity } from '../entities/ExecutionEntity';
 import { ExecutionMetadata } from '../entities/ExecutionMetadata';
 import { ExecutionDataRepository } from './executionData.repository';
-import { TIME, inTest } from '@/constants';
+import { Logger } from '@/Logger';
+import type { ExecutionSummaries } from '@/executions/execution.types';
+import { PostgresLiveRowsRetrievalError } from '@/errors/postgres-live-rows-retrieval.error';
+import { GlobalConfig } from '@n8n/config';
+import { separate } from '@/utils';
+import { ErrorReporterProxy as ErrorReporter } from 'n8n-workflow';
+
+export interface IGetExecutionsQueryFilter {
+	id?: FindOperator<string> | string;
+	finished?: boolean;
+	mode?: string;
+	retryOf?: string;
+	retrySuccessId?: string;
+	status?: ExecutionStatus[];
+	workflowId?: string;
+	waitTill?: FindOperator<any> | boolean;
+	metadata?: Array<{ key: string; value: string }>;
+	startedAfter?: string;
+	startedBefore?: string;
+}
 
 function parseFiltersToQueryBuilder(
 	qb: SelectQueryBuilder<ExecutionEntity>,
@@ -39,7 +73,7 @@ function parseFiltersToQueryBuilder(
 	if (filters?.finished) {
 		qb.andWhere({ finished: filters.finished });
 	}
-	if (filters?.metadata && isAdvancedExecutionFiltersEnabled()) {
+	if (filters?.metadata) {
 		qb.leftJoin(ExecutionMetadata, 'md', 'md.executionId = execution.id');
 		for (const md of filters.metadata) {
 			qb.andWhere('md.key = :key AND md.value = :value', md);
@@ -66,62 +100,26 @@ function parseFiltersToQueryBuilder(
 	}
 }
 
+const lessThanOrEqual = (date: string): unknown => {
+	return LessThanOrEqual(DateUtils.mixedDateToUtcDatetimeString(new Date(date)));
+};
+
+const moreThanOrEqual = (date: string): unknown => {
+	return MoreThanOrEqual(DateUtils.mixedDateToUtcDatetimeString(new Date(date)));
+};
+
 @Service()
 export class ExecutionRepository extends Repository<ExecutionEntity> {
-	private logger = Logger;
-
-	deletionBatchSize = 100;
-
-	private intervals: Record<string, NodeJS.Timer | undefined> = {
-		softDeletion: undefined,
-		hardDeletion: undefined,
-	};
-
-	private rates: Record<string, number> = {
-		softDeletion: 1 * TIME.HOUR,
-		hardDeletion: 15 * TIME.MINUTE,
-	};
-
-	private isMainInstance = config.get('generic.instanceType') === 'main';
-
-	private isPruningEnabled = config.getEnv('executions.pruneData');
+	private hardDeletionBatchSize = 100;
 
 	constructor(
 		dataSource: DataSource,
+		private readonly globalConfig: GlobalConfig,
+		private readonly logger: Logger,
 		private readonly executionDataRepository: ExecutionDataRepository,
 		private readonly binaryDataService: BinaryDataService,
 	) {
 		super(ExecutionEntity, dataSource.manager);
-
-		if (!this.isMainInstance || inTest) return;
-
-		if (this.isPruningEnabled) this.setSoftDeletionInterval();
-
-		this.setHardDeletionInterval();
-	}
-
-	clearTimers() {
-		if (!this.isMainInstance) return;
-
-		this.logger.debug('Clearing soft-deletion and hard-deletion intervals for executions');
-
-		clearInterval(this.intervals.softDeletion);
-		clearInterval(this.intervals.hardDeletion);
-	}
-
-	setSoftDeletionInterval() {
-		this.logger.debug('Setting soft-deletion interval (pruning) for executions');
-
-		this.intervals.softDeletion = setInterval(async () => this.prune(), this.rates.hardDeletion);
-	}
-
-	setHardDeletionInterval() {
-		this.logger.debug('Setting hard-deletion interval for executions');
-
-		this.intervals.hardDeletion = setInterval(
-			async () => this.hardDelete(),
-			this.rates.hardDeletion,
-		);
 	}
 
 	async findMultipleExecutions(
@@ -156,27 +154,33 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 			if (!queryParams.relations) {
 				queryParams.relations = [];
 			}
-			(queryParams.relations as string[]).push('executionData');
+			(queryParams.relations as string[]).push('executionData', 'metadata');
 		}
 
 		const executions = await this.find(queryParams);
 
 		if (options?.includeData && options?.unflattenData) {
-			return executions.map((execution) => {
-				const { executionData, ...rest } = execution;
+			const [valid, invalid] = separate(executions, (e) => e.executionData !== null);
+			this.reportInvalidExecutions(invalid);
+			return valid.map((execution) => {
+				const { executionData, metadata, ...rest } = execution;
 				return {
 					...rest,
 					data: parse(executionData.data) as IRunExecutionData,
 					workflowData: executionData.workflowData,
+					customData: Object.fromEntries(metadata.map((m) => [m.key, m.value])),
 				} as IExecutionResponse;
 			});
 		} else if (options?.includeData) {
-			return executions.map((execution) => {
-				const { executionData, ...rest } = execution;
+			const [valid, invalid] = separate(executions, (e) => e.executionData !== null);
+			this.reportInvalidExecutions(invalid);
+			return valid.map((execution) => {
+				const { executionData, metadata, ...rest } = execution;
 				return {
 					...rest,
 					data: execution.executionData.data,
 					workflowData: execution.executionData.workflowData,
+					customData: Object.fromEntries(metadata.map((m) => [m.key, m.value])),
 				} as IExecutionFlattedDb;
 			});
 		}
@@ -185,6 +189,16 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 			const { executionData, ...rest } = execution;
 			return rest;
 		});
+	}
+
+	reportInvalidExecutions(executions: ExecutionEntity[]) {
+		if (executions.length === 0) return;
+
+		ErrorReporter.error(
+			new ApplicationError('Found executions without executionData', {
+				extra: { executionIds: executions.map(({ id }) => id) },
+			}),
+		);
 	}
 
 	async findSingleExecution(
@@ -219,55 +233,59 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 			where?: FindOptionsWhere<ExecutionEntity>;
 		},
 	): Promise<IExecutionFlattedDb | IExecutionResponse | IExecutionBase | undefined> {
-		const whereClause: FindOneOptions<ExecutionEntity> = {
+		const findOptions: FindOneOptions<ExecutionEntity> = {
 			where: {
 				id,
 				...options?.where,
 			},
 		};
 		if (options?.includeData) {
-			whereClause.relations = ['executionData'];
+			findOptions.relations = ['executionData', 'metadata'];
 		}
 
-		const execution = await this.findOne(whereClause);
+		const execution = await this.findOne(findOptions);
 
 		if (!execution) {
 			return undefined;
 		}
 
-		const { executionData, ...rest } = execution;
+		const { executionData, metadata, ...rest } = execution;
 
 		if (options?.includeData && options?.unflattenData) {
 			return {
 				...rest,
 				data: parse(execution.executionData.data) as IRunExecutionData,
 				workflowData: execution.executionData.workflowData,
+				customData: Object.fromEntries(metadata.map((m) => [m.key, m.value])),
 			} as IExecutionResponse;
 		} else if (options?.includeData) {
 			return {
 				...rest,
 				data: execution.executionData.data,
 				workflowData: execution.executionData.workflowData,
+				customData: Object.fromEntries(metadata.map((m) => [m.key, m.value])),
 			} as IExecutionFlattedDb;
 		}
 
 		return rest;
 	}
 
-	async createNewExecution(execution: ExecutionPayload) {
+	async createNewExecution(execution: ExecutionPayload): Promise<string> {
 		const { data, workflowData, ...rest } = execution;
-
-		const newExecution = await this.save(rest);
-		await this.executionDataRepository.save({
-			execution: newExecution,
-			workflowData,
+		const { identifiers: inserted } = await this.insert(rest);
+		const { id: executionId } = inserted[0] as { id: string };
+		const { connections, nodes, name, settings } = workflowData ?? {};
+		await this.executionDataRepository.insert({
+			executionId,
+			workflowData: { connections, nodes, name, settings, id: workflowData.id },
 			data: stringify(data),
 		});
-
-		return newExecution;
+		return String(executionId);
 	}
 
-	async markAsCrashed(executionIds: string[]) {
+	async markAsCrashed(executionIds: string | string[]) {
+		if (!Array.isArray(executionIds)) executionIds = [executionIds];
+
 		await this.update(
 			{ id: In(executionIds) },
 			{
@@ -275,13 +293,34 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 				stoppedAt: new Date(),
 			},
 		);
+
+		this.logger.info('Marked executions as `crashed`', { executionIds });
+	}
+
+	/**
+	 * Permanently remove a single execution and its binary data.
+	 */
+	async hardDelete(ids: { workflowId: string; executionId: string }) {
+		return await Promise.all([
+			this.delete(ids.executionId),
+			this.binaryDataService.deleteMany([ids]),
+		]);
+	}
+
+	async updateStatus(executionId: string, status: ExecutionStatus) {
+		await this.update({ id: executionId }, { status });
+	}
+
+	async resetStartedAt(executionId: string) {
+		await this.update({ id: executionId }, { startedAt: new Date() });
 	}
 
 	async updateExistingExecution(executionId: string, execution: Partial<IExecutionResponse>) {
 		// Se isolate startedAt because it must be set when the execution starts and should never change.
 		// So we prevent updating it, if it's sent (it usually is and causes problems to executions that
 		// are resumed after waiting for some time, as a new startedAt is set)
-		const { id, data, workflowData, startedAt, ...executionInformation } = execution;
+		const { id, data, workflowId, workflowData, startedAt, customData, ...executionInformation } =
+			execution;
 		if (Object.keys(executionInformation).length > 0) {
 			await this.update({ id: executionId }, executionInformation);
 		}
@@ -299,114 +338,6 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		}
 	}
 
-	async countExecutions(
-		filters: IGetExecutionsQueryFilter | undefined,
-		accessibleWorkflowIds: string[],
-		currentlyRunningExecutions: string[],
-		isOwner: boolean,
-	): Promise<{ count: number; estimated: boolean }> {
-		const dbType = config.getEnv('database.type');
-		if (dbType !== 'postgresdb' || (filters && Object.keys(filters).length > 0) || !isOwner) {
-			const query = this.createQueryBuilder('execution').andWhere(
-				'execution.workflowId IN (:...accessibleWorkflowIds)',
-				{ accessibleWorkflowIds },
-			);
-			if (currentlyRunningExecutions.length > 0) {
-				query.andWhere('execution.id NOT IN (:...currentlyRunningExecutions)', {
-					currentlyRunningExecutions,
-				});
-			}
-
-			parseFiltersToQueryBuilder(query, filters);
-
-			const count = await query.getCount();
-			return { count, estimated: false };
-		}
-
-		try {
-			// Get an estimate of rows count.
-			const estimateRowsNumberSql =
-				"SELECT n_live_tup FROM pg_stat_all_tables WHERE relname = 'execution_entity';";
-			const rows = (await this.query(estimateRowsNumberSql)) as Array<{ n_live_tup: string }>;
-
-			const estimate = parseInt(rows[0].n_live_tup, 10);
-			// If over 100k, return just an estimate.
-			if (estimate > 100_000) {
-				// if less than 100k, we get the real count as even a full
-				// table scan should not take so long.
-				return { count: estimate, estimated: true };
-			}
-		} catch (error) {
-			if (error instanceof Error) {
-				Logger.warn(`Failed to get executions count from Postgres: ${error.message}`, {
-					error,
-				});
-			}
-		}
-
-		const count = await this.count({
-			where: {
-				workflowId: In(accessibleWorkflowIds),
-			},
-		});
-
-		return { count, estimated: false };
-	}
-
-	async searchExecutions(
-		filters: IGetExecutionsQueryFilter | undefined,
-		limit: number,
-		excludedExecutionIds: string[],
-		accessibleWorkflowIds: string[],
-		additionalFilters?: { lastId?: string; firstId?: string },
-	): Promise<IExecutionsSummary[]> {
-		if (accessibleWorkflowIds.length === 0) {
-			return [];
-		}
-		const query = this.createQueryBuilder('execution')
-			.select([
-				'execution.id',
-				'execution.finished',
-				'execution.mode',
-				'execution.retryOf',
-				'execution.retrySuccessId',
-				'execution.status',
-				'execution.startedAt',
-				'execution.stoppedAt',
-				'execution.workflowId',
-				'execution.waitTill',
-				'workflow.name',
-			])
-			.innerJoin('execution.workflow', 'workflow')
-			.limit(limit)
-			// eslint-disable-next-line @typescript-eslint/naming-convention
-			.orderBy({ 'execution.id': 'DESC' })
-			.andWhere('execution.workflowId IN (:...accessibleWorkflowIds)', { accessibleWorkflowIds });
-		if (excludedExecutionIds.length > 0) {
-			query.andWhere('execution.id NOT IN (:...excludedExecutionIds)', { excludedExecutionIds });
-		}
-
-		if (additionalFilters?.lastId) {
-			query.andWhere('execution.id < :lastId', { lastId: additionalFilters.lastId });
-		}
-		if (additionalFilters?.firstId) {
-			query.andWhere('execution.id > :firstId', { firstId: additionalFilters.firstId });
-		}
-
-		parseFiltersToQueryBuilder(query, filters);
-
-		const executions = await query.getMany();
-
-		return executions.map((execution) => {
-			const { workflow, waitTill, ...rest } = execution;
-			return {
-				...rest,
-				waitTill: waitTill ?? undefined,
-				workflowName: workflow.name,
-			};
-		});
-	}
-
 	async deleteExecutionsByFilter(
 		filters: IGetExecutionsQueryFilter | undefined,
 		accessibleWorkflowIds: string[],
@@ -416,11 +347,13 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 		},
 	) {
 		if (!deleteConditions?.deleteBefore && !deleteConditions?.ids) {
-			throw new Error('Either "deleteBefore" or "ids" must be present in the request body');
+			throw new ApplicationError(
+				'Either "deleteBefore" or "ids" must be present in the request body',
+			);
 		}
 
 		const query = this.createQueryBuilder('execution')
-			.select(['execution.id'])
+			.select(['execution.id', 'execution.workflowId'])
 			.andWhere('execution.workflowId IN (:...accessibleWorkflowIds)', { accessibleWorkflowIds });
 
 		if (deleteConditions.deleteBefore) {
@@ -439,24 +372,38 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 
 		if (!executions.length) {
 			if (deleteConditions.ids) {
-				Logger.error('Failed to delete an execution due to insufficient permissions', {
+				this.logger.error('Failed to delete an execution due to insufficient permissions', {
 					executionIds: deleteConditions.ids,
 				});
 			}
 			return;
 		}
 
-		const executionIds = executions.map(({ id }) => id);
+		const ids = executions.map(({ id, workflowId }) => ({
+			executionId: id,
+			workflowId,
+		}));
+
 		do {
 			// Delete in batches to avoid "SQLITE_ERROR: Expression tree is too large (maximum depth 1000)" error
-			const batch = executionIds.splice(0, this.deletionBatchSize);
-			await this.softDelete(batch);
-		} while (executionIds.length > 0);
+			const batch = ids.splice(0, this.hardDeletionBatchSize);
+			await Promise.all([
+				this.delete(batch.map(({ executionId }) => executionId)),
+				this.binaryDataService.deleteMany(batch),
+			]);
+		} while (ids.length > 0);
 	}
 
-	async prune() {
-		Logger.verbose('Soft-deleting (pruning) execution data from database');
+	async getIdsSince(date: Date) {
+		return await this.find({
+			select: ['id'],
+			where: {
+				startedAt: MoreThanOrEqual(DateUtils.mixedDateToUtcDatetimeString(date)),
+			},
+		}).then((executions) => executions.map(({ id }) => id));
+	}
 
+	async softDeletePrunableExecutions() {
 		const maxAge = config.getEnv('executions.pruneDataMaxAge'); // in h
 		const maxCount = config.getEnv('executions.pruneDataMaxCount');
 
@@ -484,10 +431,15 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 
 		const [timeBasedWhere, countBasedWhere] = toPrune;
 
-		await this.createQueryBuilder()
+		return await this.createQueryBuilder()
 			.update(ExecutionEntity)
 			.set({ deletedAt: new Date() })
-			.where(
+			.where({
+				deletedAt: IsNull(),
+				// Only mark executions as deleted if they are in an end state
+				status: Not(In(['new', 'running', 'waiting'])),
+			})
+			.andWhere(
 				new Brackets((qb) =>
 					countBasedWhere
 						? qb.where(timeBasedWhere).orWhere(countBasedWhere)
@@ -497,13 +449,9 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 			.execute();
 	}
 
-	/**
-	 * Permanently delete all soft-deleted executions and their binary data, in batches.
-	 */
-	private async hardDelete() {
-		// Find ids of all executions that were deleted over an hour ago
+	async hardDeleteSoftDeletedExecutions() {
 		const date = new Date();
-		date.setHours(date.getHours() - 1);
+		date.setHours(date.getHours() - config.getEnv('executions.pruneDataHardDeleteBuffer'));
 
 		const workflowIdsAndExecutionIds = (
 			await this.find({
@@ -511,7 +459,7 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 				where: {
 					deletedAt: LessThanOrEqual(DateUtils.mixedDateToUtcDatetimeString(date)),
 				},
-				take: this.deletionBatchSize,
+				take: this.hardDeletionBatchSize,
 
 				/**
 				 * @important This ensures soft-deleted executions are included,
@@ -521,38 +469,365 @@ export class ExecutionRepository extends Repository<ExecutionEntity> {
 			})
 		).map(({ id: executionId, workflowId }) => ({ workflowId, executionId }));
 
-		const executionIds = workflowIdsAndExecutionIds.map((o) => o.executionId);
+		return workflowIdsAndExecutionIds;
+	}
 
-		if (executionIds.length === 0) {
-			this.logger.debug('Found no executions to hard-delete from database');
-			return;
+	async deleteByIds(executionIds: string[]) {
+		return await this.delete({ id: In(executionIds) });
+	}
+
+	async getWaitingExecutions() {
+		// Find all the executions which should be triggered in the next 70 seconds
+		const waitTill = new Date(Date.now() + 70000);
+		const where: FindOptionsWhere<ExecutionEntity> = {
+			waitTill: LessThanOrEqual(waitTill),
+			status: Not('crashed'),
+		};
+
+		const dbType = this.globalConfig.database.type;
+		if (dbType === 'sqlite') {
+			// This is needed because of issue in TypeORM <> SQLite:
+			// https://github.com/typeorm/typeorm/issues/2286
+			where.waitTill = LessThanOrEqual(DateUtils.mixedDateToUtcDatetimeString(waitTill));
 		}
 
-		await this.binaryDataService.deleteMany(workflowIdsAndExecutionIds);
+		return await this.findMultipleExecutions({
+			select: ['id', 'waitTill'],
+			where,
+			order: {
+				waitTill: 'ASC',
+			},
+		});
+	}
 
-		this.logger.debug(`Hard-deleting ${executionIds.length} executions from database`, {
-			executionIds,
+	async getExecutionsCountForPublicApi(data: {
+		limit: number;
+		lastId?: string;
+		workflowIds?: string[];
+		status?: ExecutionStatus;
+		excludedWorkflowIds?: string[];
+	}): Promise<number> {
+		const executions = await this.count({
+			where: {
+				...(data.lastId && { id: LessThan(data.lastId) }),
+				...(data.status && { ...this.getStatusCondition(data.status) }),
+				...(data.workflowIds && { workflowId: In(data.workflowIds) }),
+				...(data.excludedWorkflowIds && { workflowId: Not(In(data.excludedWorkflowIds)) }),
+			},
+			take: data.limit,
 		});
 
-		// Actually delete these executions
-		await this.delete({ id: In(executionIds) });
+		return executions;
+	}
 
-		/**
-		 * If the volume of executions to prune is as high as the batch size, there is a risk
-		 * that the pruning process is unable to catch up to the creation of new executions,
-		 * with high concurrency possibly leading to errors from duplicate deletions.
-		 *
-		 * Therefore, in this high-volume case we speed up the hard deletion cycle, until
-		 * the number of executions to prune is low enough to fit in a single batch.
-		 */
-		if (executionIds.length === this.deletionBatchSize) {
-			clearInterval(this.intervals.hardDeletion);
+	private getStatusCondition(status: ExecutionStatus) {
+		const condition: Pick<FindOptionsWhere<IExecutionFlattedDb>, 'status'> = {};
 
-			setTimeout(async () => this.hardDelete(), 1 * TIME.SECOND);
-		} else {
-			if (this.intervals.hardDeletion) return;
-
-			this.setHardDeletionInterval();
+		if (status === 'success') {
+			condition.status = 'success';
+		} else if (status === 'waiting') {
+			condition.status = 'waiting';
+		} else if (status === 'error') {
+			condition.status = In(['error', 'crashed']);
 		}
+
+		return condition;
+	}
+
+	async getExecutionsForPublicApi(params: {
+		limit: number;
+		includeData?: boolean;
+		lastId?: string;
+		workflowIds?: string[];
+		status?: ExecutionStatus;
+		excludedExecutionsIds?: string[];
+	}): Promise<IExecutionBase[]> {
+		let where: FindOptionsWhere<IExecutionFlattedDb> = {};
+
+		if (params.lastId && params.excludedExecutionsIds?.length) {
+			where.id = Raw((id) => `${id} < :lastId AND ${id} NOT IN (:...excludedExecutionsIds)`, {
+				lastId: params.lastId,
+				excludedExecutionsIds: params.excludedExecutionsIds,
+			});
+		} else if (params.lastId) {
+			where.id = LessThan(params.lastId);
+		} else if (params.excludedExecutionsIds?.length) {
+			where.id = Not(In(params.excludedExecutionsIds));
+		}
+
+		if (params.status) {
+			where = { ...where, ...this.getStatusCondition(params.status) };
+		}
+
+		if (params.workflowIds) {
+			where = { ...where, workflowId: In(params.workflowIds) };
+		}
+
+		return await this.findMultipleExecutions(
+			{
+				select: [
+					'id',
+					'mode',
+					'retryOf',
+					'retrySuccessId',
+					'startedAt',
+					'stoppedAt',
+					'workflowId',
+					'waitTill',
+					'finished',
+				],
+				where,
+				order: { id: 'DESC' },
+				take: params.limit,
+				relations: ['executionData'],
+			},
+			{
+				includeData: params.includeData,
+				unflattenData: true,
+			},
+		);
+	}
+
+	async getExecutionInWorkflowsForPublicApi(
+		id: string,
+		workflowIds: string[],
+		includeData?: boolean,
+	): Promise<IExecutionBase | undefined> {
+		return await this.findSingleExecution(id, {
+			where: {
+				workflowId: In(workflowIds),
+			},
+			includeData,
+			unflattenData: true,
+		});
+	}
+
+	async findWithUnflattenedData(executionId: string, accessibleWorkflowIds: string[]) {
+		return await this.findSingleExecution(executionId, {
+			where: {
+				workflowId: In(accessibleWorkflowIds),
+			},
+			includeData: true,
+			unflattenData: true,
+		});
+	}
+
+	async findIfShared(executionId: string, sharedWorkflowIds: string[]) {
+		return await this.findSingleExecution(executionId, {
+			where: {
+				workflowId: In(sharedWorkflowIds),
+			},
+			includeData: true,
+			unflattenData: false,
+		});
+	}
+
+	async findIfAccessible(executionId: string, accessibleWorkflowIds: string[]) {
+		return await this.findSingleExecution(executionId, {
+			where: { workflowId: In(accessibleWorkflowIds) },
+		});
+	}
+
+	async stopBeforeRun(execution: IExecutionResponse) {
+		execution.status = 'canceled';
+		execution.stoppedAt = new Date();
+
+		await this.update(
+			{ id: execution.id },
+			{ status: execution.status, stoppedAt: execution.stoppedAt },
+		);
+
+		return execution;
+	}
+
+	async stopDuringRun(execution: IExecutionResponse) {
+		const error = new WorkflowOperationError('Workflow-Execution has been canceled!');
+
+		execution.data.resultData.error = {
+			...error,
+			message: error.message,
+			stack: error.stack,
+		};
+
+		execution.stoppedAt = new Date();
+		execution.waitTill = null;
+		execution.status = 'canceled';
+
+		await this.updateExistingExecution(execution.id, execution);
+
+		return execution;
+	}
+
+	async cancelMany(executionIds: string[]) {
+		await this.update({ id: In(executionIds) }, { status: 'canceled', stoppedAt: new Date() });
+	}
+
+	// ----------------------------------
+	//            new API
+	// ----------------------------------
+
+	/**
+	 * Fields to include in the summary of an execution when querying for many.
+	 */
+	private summaryFields = {
+		id: true,
+		workflowId: true,
+		mode: true,
+		retryOf: true,
+		status: true,
+		startedAt: true,
+		stoppedAt: true,
+	};
+
+	async findManyByRangeQuery(query: ExecutionSummaries.RangeQuery): Promise<ExecutionSummary[]> {
+		if (query?.accessibleWorkflowIds?.length === 0) {
+			throw new ApplicationError('Expected accessible workflow IDs');
+		}
+
+		const executions: ExecutionSummary[] = await this.toQueryBuilder(query).getRawMany();
+
+		return executions.map((execution) => this.toSummary(execution));
+	}
+
+	// @tech_debt: These transformations should not be needed
+	private toSummary(execution: {
+		id: number | string;
+		startedAt?: Date | string;
+		stoppedAt?: Date | string;
+		waitTill?: Date | string | null;
+	}): ExecutionSummary {
+		execution.id = execution.id.toString();
+
+		const normalizeDateString = (date: string) => {
+			if (date.includes(' ')) return date.replace(' ', 'T') + 'Z';
+			return date;
+		};
+
+		if (execution.startedAt) {
+			execution.startedAt =
+				execution.startedAt instanceof Date
+					? execution.startedAt.toISOString()
+					: normalizeDateString(execution.startedAt);
+		}
+
+		if (execution.waitTill) {
+			execution.waitTill =
+				execution.waitTill instanceof Date
+					? execution.waitTill.toISOString()
+					: normalizeDateString(execution.waitTill);
+		}
+
+		if (execution.stoppedAt) {
+			execution.stoppedAt =
+				execution.stoppedAt instanceof Date
+					? execution.stoppedAt.toISOString()
+					: normalizeDateString(execution.stoppedAt);
+		}
+
+		return execution as ExecutionSummary;
+	}
+
+	async fetchCount(query: ExecutionSummaries.CountQuery) {
+		return await this.toQueryBuilder(query).getCount();
+	}
+
+	async getLiveExecutionRowsOnPostgres() {
+		const tableName = `${this.globalConfig.database.tablePrefix}execution_entity`;
+
+		const pgSql = `SELECT n_live_tup as result FROM pg_stat_all_tables WHERE relname = '${tableName}';`;
+
+		try {
+			const rows = (await this.query(pgSql)) as Array<{ result: string }>;
+
+			if (rows.length !== 1) throw new PostgresLiveRowsRetrievalError(rows);
+
+			const [row] = rows;
+
+			return parseInt(row.result, 10);
+		} catch (error) {
+			if (error instanceof Error) this.logger.error(error.message, { error });
+
+			return -1;
+		}
+	}
+
+	private toQueryBuilder(query: ExecutionSummaries.Query) {
+		const {
+			accessibleWorkflowIds,
+			status,
+			finished,
+			workflowId,
+			startedBefore,
+			startedAfter,
+			metadata,
+		} = query;
+
+		const fields = Object.keys(this.summaryFields)
+			.concat(['waitTill', 'retrySuccessId'])
+			.map((key) => `execution.${key} AS "${key}"`)
+			.concat('workflow.name AS "workflowName"');
+
+		const qb = this.createQueryBuilder('execution')
+			.select(fields)
+			.innerJoin('execution.workflow', 'workflow')
+			.where('execution.workflowId IN (:...accessibleWorkflowIds)', { accessibleWorkflowIds });
+
+		if (query.kind === 'range') {
+			const { limit, firstId, lastId } = query.range;
+
+			qb.limit(limit);
+
+			if (firstId) qb.andWhere('execution.id > :firstId', { firstId });
+			if (lastId) qb.andWhere('execution.id < :lastId', { lastId });
+
+			if (query.order?.stoppedAt === 'DESC') {
+				qb.orderBy({ 'execution.stoppedAt': 'DESC' });
+			} else if (query.order?.top) {
+				qb.orderBy(`(CASE WHEN execution.status = '${query.order.top}' THEN 0 ELSE 1 END)`);
+			} else {
+				qb.orderBy({ 'execution.id': 'DESC' });
+			}
+		}
+
+		if (status) qb.andWhere('execution.status IN (:...status)', { status });
+		if (finished) qb.andWhere({ finished });
+		if (workflowId) qb.andWhere({ workflowId });
+		if (startedBefore) qb.andWhere({ startedAt: lessThanOrEqual(startedBefore) });
+		if (startedAfter) qb.andWhere({ startedAt: moreThanOrEqual(startedAfter) });
+
+		if (metadata?.length === 1) {
+			const [{ key, value }] = metadata;
+
+			qb.innerJoin(
+				ExecutionMetadata,
+				'md',
+				'md.executionId = execution.id AND md.key = :key AND md.value = :value',
+			);
+
+			qb.setParameter('key', key);
+			qb.setParameter('value', value);
+		}
+
+		return qb;
+	}
+
+	async getAllIds() {
+		const executions = await this.find({ select: ['id'], order: { id: 'ASC' } });
+
+		return executions.map(({ id }) => id);
+	}
+
+	/**
+	 * Retrieve a batch of execution IDs with `new` or `running` status, in most recent order.
+	 */
+	async getInProgressExecutionIds(batchSize: number) {
+		const executions = await this.find({
+			select: ['id'],
+			where: { status: In(['new', 'running']) },
+			order: { startedAt: 'DESC' },
+			take: batchSize,
+		});
+
+		return executions.map(({ id }) => id);
 	}
 }

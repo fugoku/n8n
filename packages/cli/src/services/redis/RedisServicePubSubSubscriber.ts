@@ -1,10 +1,5 @@
 import { Service } from 'typedi';
-import { LoggerProxy as Logger } from 'n8n-workflow';
-import {
-	COMMAND_REDIS_CHANNEL,
-	EVENT_BUS_REDIS_CHANNEL,
-	WORKER_RESPONSE_REDIS_CHANNEL,
-} from './RedisServiceHelper';
+import { COMMAND_REDIS_CHANNEL, WORKER_RESPONSE_REDIS_CHANNEL } from './RedisConstants';
 import { RedisServiceBaseReceiver } from './RedisServiceBaseClasses';
 
 @Service()
@@ -25,9 +20,9 @@ export class RedisServicePubSubSubscriber extends RedisServiceBaseReceiver {
 		}
 		await this.redisClient?.subscribe(channel, (error, _count: number) => {
 			if (error) {
-				Logger.error(`Error subscribing to channel ${channel}`);
+				this.logger.error(`Error subscribing to channel ${channel}`);
 			} else {
-				Logger.debug(`Subscribed Redis PubSub client to channel: ${channel}`);
+				this.logger.debug(`Subscribed Redis PubSub client to channel: ${channel}`);
 			}
 		});
 	}
@@ -38,15 +33,11 @@ export class RedisServicePubSubSubscriber extends RedisServiceBaseReceiver {
 		}
 		await this.redisClient?.unsubscribe(channel, (error, _count: number) => {
 			if (error) {
-				Logger.error(`Error unsubscribing from channel ${channel}`);
+				this.logger.error(`Error unsubscribing from channel ${channel}`);
 			} else {
-				Logger.debug(`Unsubscribed Redis PubSub client from channel: ${channel}`);
+				this.logger.debug(`Unsubscribed Redis PubSub client from channel: ${channel}`);
 			}
 		});
-	}
-
-	async subscribeToEventLog(): Promise<void> {
-		await this.subscribe(EVENT_BUS_REDIS_CHANNEL);
 	}
 
 	async subscribeToCommandChannel(): Promise<void> {
@@ -55,10 +46,6 @@ export class RedisServicePubSubSubscriber extends RedisServiceBaseReceiver {
 
 	async subscribeToWorkerResponseChannel(): Promise<void> {
 		await this.subscribe(WORKER_RESPONSE_REDIS_CHANNEL);
-	}
-
-	async unSubscribeFromEventLog(): Promise<void> {
-		await this.unsubscribe(EVENT_BUS_REDIS_CHANNEL);
 	}
 
 	async unSubscribeFromCommandChannel(): Promise<void> {

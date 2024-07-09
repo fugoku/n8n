@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/naming-convention */
+import { Container } from 'typedi';
 import type { Router } from 'express';
 import express from 'express';
 import fs from 'fs/promises';
@@ -11,11 +11,12 @@ import type { OpenAPIV3 } from 'openapi-types';
 import type { JsonObject } from 'swagger-ui-express';
 
 import config from '@/config';
-import * as Db from '@/Db';
-import { getInstanceBaseUrl } from '@/UserManagement/UserManagementHelper';
-import { Container } from 'typedi';
+
 import { InternalHooks } from '@/InternalHooks';
 import { License } from '@/License';
+import { UserRepository } from '@db/repositories/user.repository';
+import { UrlService } from '@/services/url.service';
+import type { AuthenticatedRequest } from '@/requests';
 
 async function createApiRouter(
 	version: string,
@@ -29,7 +30,7 @@ async function createApiRouter(
 	// from the Swagger UI
 	swaggerDocument.server = [
 		{
-			url: `${getInstanceBaseUrl()}/${publicApiEndpoint}/${version}}`,
+			url: `${Container.get(UrlService).getInstanceBaseUrl()}/${publicApiEndpoint}/${version}}`,
 		},
 	];
 	const apiController = express.Router();
@@ -50,7 +51,7 @@ async function createApiRouter(
 		);
 	}
 
-	apiController.get(`/${publicApiEndpoint}/${version}/openapi.yml`, (req, res) => {
+	apiController.get(`/${publicApiEndpoint}/${version}/openapi.yml`, (_, res) => {
 		res.sendFile(openApiSpecPath);
 	});
 
@@ -63,20 +64,17 @@ async function createApiRouter(
 			operationHandlers: handlersDirectory,
 			validateRequests: true,
 			validateApiSpec: true,
-			formats: [
-				{
-					name: 'email',
+			formats: {
+				email: {
 					type: 'string',
 					validate: (email: string) => validator.isEmail(email),
 				},
-				{
-					name: 'identifier',
+				identifier: {
 					type: 'string',
 					validate: (identifier: string) =>
 						validator.isUUID(identifier) || validator.isEmail(identifier),
 				},
-				{
-					name: 'jsonString',
+				jsonString: {
 					validate: (data: string) => {
 						try {
 							JSON.parse(data);
@@ -86,18 +84,17 @@ async function createApiRouter(
 						}
 					},
 				},
-			],
+			},
 			validateSecurity: {
 				handlers: {
 					ApiKeyAuth: async (
-						req: express.Request,
+						req: AuthenticatedRequest,
 						_scopes: unknown,
 						schema: OpenAPIV3.ApiKeySecurityScheme,
 					): Promise<boolean> => {
 						const apiKey = req.headers[schema.name.toLowerCase()] as string;
-						const user = await Db.collections.User.findOne({
+						const user = await Container.get(UserRepository).findOne({
 							where: { apiKey },
-							relations: ['globalRole'],
 						});
 
 						if (!user) return false;
@@ -143,21 +140,18 @@ export const loadPublicApiVersions = async (
 	const apiRouters = await Promise.all(
 		versions.map(async (version) => {
 			const openApiPath = path.join(__dirname, version, 'openapi.yml');
-			return createApiRouter(version, openApiPath, __dirname, publicApiEndpoint);
+			return await createApiRouter(version, openApiPath, __dirname, publicApiEndpoint);
 		}),
 	);
 
+	const version = versions.pop()?.charAt(1);
+
 	return {
 		apiRouters,
-		apiLatestVersion: Number(versions.pop()?.charAt(1)) ?? 1,
+		apiLatestVersion: version ? Number(version) : 1,
 	};
 };
 
-function isApiEnabledByLicense(): boolean {
-	const license = Container.get(License);
-	return !license.isAPIDisabled();
-}
-
 export function isApiEnabled(): boolean {
-	return !config.get('publicApi.disabled') && isApiEnabledByLicense();
+	return !config.get('publicApi.disabled') && !Container.get(License).isAPIDisabled();
 }

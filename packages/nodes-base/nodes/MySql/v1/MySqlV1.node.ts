@@ -15,9 +15,10 @@ import { NodeOperationError } from 'n8n-workflow';
 
 import type mysql2 from 'mysql2/promise';
 
-import { copyInputItems, createConnection, searchTables } from './GenericFunctions';
+import { createConnection, searchTables } from './GenericFunctions';
 
 import { oldVersionNotice } from '@utils/descriptions';
+import { getResolvables } from '@utils/utilities';
 
 const versionDescription: INodeTypeDescription = {
 	displayName: 'MySQL',
@@ -78,7 +79,6 @@ const versionDescription: INodeTypeDescription = {
 			noDataExpression: true,
 			typeOptions: {
 				editor: 'sqlEditor',
-				rows: 5,
 				sqlDialect: 'MySQL',
 			},
 			displayOptions: {
@@ -306,10 +306,17 @@ export class MySqlV1 implements INodeType {
 			// ----------------------------------
 
 			try {
-				const queryQueue = items.map(async (item, index) => {
-					const rawQuery = this.getNodeParameter('query', index) as string;
+				const queryQueue = items.map(async (_, index) => {
+					let rawQuery = (this.getNodeParameter('query', index) as string).trim();
 
-					return connection.query(rawQuery);
+					for (const resolvable of getResolvables(rawQuery)) {
+						rawQuery = rawQuery.replace(
+							resolvable,
+							this.evaluateExpression(resolvable, index) as string,
+						);
+					}
+
+					return await connection.query(rawQuery);
 				});
 
 				returnItems = ((await Promise.all(queryQueue)) as mysql2.OkPacket[][]).reduce(
@@ -328,7 +335,7 @@ export class MySqlV1 implements INodeType {
 					[] as INodeExecutionData[],
 				);
 			} catch (error) {
-				if (this.continueOnFail()) {
+				if (this.continueOnFail(error)) {
 					returnItems = this.helpers.returnJsonArray({ error: error.message });
 				} else {
 					await connection.end();
@@ -344,7 +351,7 @@ export class MySqlV1 implements INodeType {
 				const table = this.getNodeParameter('table', 0, '', { extractValue: true }) as string;
 				const columnString = this.getNodeParameter('columns', 0) as string;
 				const columns = columnString.split(',').map((column) => column.trim());
-				const insertItems = copyInputItems(items, columns);
+				const insertItems = this.helpers.copyInputItems(items, columns);
 				const insertPlaceholder = `(${columns.map((_column) => '?').join(',')})`;
 				const options = this.getNodeParameter('options', 0);
 				const insertIgnore = options.ignore as boolean;
@@ -365,7 +372,7 @@ export class MySqlV1 implements INodeType {
 
 				returnItems = this.helpers.returnJsonArray(queryResult[0] as unknown as IDataObject);
 			} catch (error) {
-				if (this.continueOnFail()) {
+				if (this.continueOnFail(error)) {
 					returnItems = this.helpers.returnJsonArray({ error: error.message });
 				} else {
 					await connection.end();
@@ -387,19 +394,20 @@ export class MySqlV1 implements INodeType {
 					columns.unshift(updateKey);
 				}
 
-				const updateItems = copyInputItems(items, columns);
+				const updateItems = this.helpers.copyInputItems(items, columns);
 				const updateSQL = `UPDATE ${table} SET ${columns
 					.map((column) => `${column} = ?`)
 					.join(',')} WHERE ${updateKey} = ?;`;
-				const queryQueue = updateItems.map(async (item) =>
-					connection.query(updateSQL, Object.values(item).concat(item[updateKey])),
+				const queryQueue = updateItems.map(
+					async (item) =>
+						await connection.query(updateSQL, Object.values(item).concat(item[updateKey])),
 				);
 				const queryResult = await Promise.all(queryQueue);
 				returnItems = this.helpers.returnJsonArray(
 					queryResult.map((result) => result[0]) as unknown as IDataObject[],
 				);
 			} catch (error) {
-				if (this.continueOnFail()) {
+				if (this.continueOnFail(error)) {
 					returnItems = this.helpers.returnJsonArray({ error: error.message });
 				} else {
 					await connection.end();

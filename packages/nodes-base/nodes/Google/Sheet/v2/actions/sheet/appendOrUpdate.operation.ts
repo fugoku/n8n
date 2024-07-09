@@ -1,13 +1,22 @@
-import type { IExecuteFunctions, IDataObject, INodeExecutionData } from 'n8n-workflow';
+import type {
+	IExecuteFunctions,
+	IDataObject,
+	INodeExecutionData,
+	ResourceMapperField,
+} from 'n8n-workflow';
+import { NodeOperationError } from 'n8n-workflow';
 import type {
 	ISheetUpdateData,
 	SheetProperties,
 	ValueInputOption,
 	ValueRenderOption,
 } from '../../helpers/GoogleSheets.types';
-import { NodeOperationError } from 'n8n-workflow';
 import type { GoogleSheet } from '../../helpers/GoogleSheet';
-import { untilSheetSelected } from '../../helpers/GoogleSheets.utils';
+import {
+	cellFormatDefault,
+	checkForSchemaChanges,
+	untilSheetSelected,
+} from '../../helpers/GoogleSheets.utils';
 import { cellFormat, handlingExtraData, locationDefine } from './commonDescription';
 
 export const description: SheetProperties = [
@@ -172,7 +181,7 @@ export const description: SheetProperties = [
 			show: {
 				resource: ['sheet'],
 				operation: ['appendOrUpdate'],
-				'@version': [4],
+				'@version': [{ _cnd: { gte: 4 } }],
 			},
 			hide: {
 				...untilSheetSelected,
@@ -194,7 +203,23 @@ export const description: SheetProperties = [
 				...untilSheetSelected,
 			},
 		},
-		options: [...cellFormat, ...locationDefine, ...handlingExtraData],
+		options: [
+			cellFormat,
+			locationDefine,
+			handlingExtraData,
+			{
+				...handlingExtraData,
+				displayOptions: { show: { '/columns.mappingMode': ['autoMapInputData'] } },
+			},
+			{
+				displayName: 'Use Append',
+				name: 'useAppend',
+				type: 'boolean',
+				default: false,
+				description:
+					'Whether to use append instead of update(default), this is more efficient but in some cases data might be misaligned',
+			},
+		],
 	},
 ];
 
@@ -205,8 +230,15 @@ export async function execute(
 	sheetId: string,
 ): Promise<INodeExecutionData[]> {
 	const items = this.getInputData();
-	const valueInputMode = this.getNodeParameter('options.cellFormat', 0, 'RAW') as ValueInputOption;
+	const nodeVersion = this.getNode().typeVersion;
+
 	const range = `${sheetName}!A:Z`;
+
+	const valueInputMode = this.getNodeParameter(
+		'options.cellFormat',
+		0,
+		cellFormatDefault(nodeVersion),
+	) as ValueInputOption;
 
 	const options = this.getNodeParameter('options', 0, {});
 
@@ -214,31 +246,41 @@ export async function execute(
 
 	const locationDefineOption = (options.locationDefine as IDataObject)?.values as IDataObject;
 
-	let headerRow = 0;
-	let firstDataRow = 1;
+	let keyRowIndex = 0;
+	let dataStartRowIndex = 1;
 
 	if (locationDefineOption) {
 		if (locationDefineOption.headerRow) {
-			headerRow = parseInt(locationDefineOption.headerRow as string, 10) - 1;
+			keyRowIndex = parseInt(locationDefineOption.headerRow as string, 10) - 1;
 		}
 		if (locationDefineOption.firstDataRow) {
-			firstDataRow = parseInt(locationDefineOption.firstDataRow as string, 10) - 1;
+			dataStartRowIndex = parseInt(locationDefineOption.firstDataRow as string, 10) - 1;
 		}
 	}
+
+	const dataMode =
+		nodeVersion < 4
+			? (this.getNodeParameter('dataMode', 0) as string)
+			: (this.getNodeParameter('columns.mappingMode', 0) as string);
 
 	let columnNames: string[] = [];
 
-	const sheetData = await sheet.getData(sheetName, 'FORMATTED_VALUE');
+	const sheetData = (await sheet.getData(sheetName, 'FORMATTED_VALUE')) ?? [];
 
-	if (sheetData === undefined || sheetData[headerRow] === undefined) {
+	if (!sheetData[keyRowIndex] && dataMode !== 'autoMapInputData') {
 		throw new NodeOperationError(
 			this.getNode(),
-			`Could not retrieve the column names from row ${headerRow + 1}`,
+			`Could not retrieve the column names from row ${keyRowIndex + 1}`,
 		);
 	}
 
-	columnNames = sheetData[headerRow];
-	const nodeVersion = this.getNode().typeVersion;
+	columnNames = sheetData[keyRowIndex] ?? [];
+
+	if (nodeVersion >= 4.4) {
+		const schema = this.getNodeParameter('columns.schema', 0) as ResourceMapperField[];
+		checkForSchemaChanges(this.getNode(), columnNames, schema);
+	}
+
 	const newColumns = new Set<string>();
 
 	const columnsToMatchOn: string[] =
@@ -246,54 +288,53 @@ export async function execute(
 			? [this.getNodeParameter('columnToMatchOn', 0) as string]
 			: (this.getNodeParameter('columns.matchingColumns', 0) as string[]);
 
-	const dataMode =
-		nodeVersion < 4
-			? (this.getNodeParameter('dataMode', 0) as string)
-			: (this.getNodeParameter('columns.mappingMode', 0) as string);
-
 	// TODO: Add support for multiple columns to match on in the next overhaul
 	const keyIndex = columnNames.indexOf(columnsToMatchOn[0]);
 
-	const columnValues = await sheet.getColumnValues(
+	const columnValuesList = await sheet.getColumnValues({
 		range,
 		keyIndex,
-		firstDataRow,
+		dataStartRowIndex,
 		valueRenderMode,
 		sheetData,
-	);
+	});
 
 	const updateData: ISheetUpdateData[] = [];
 	const appendData: IDataObject[] = [];
+
+	const errorOnUnexpectedColumn = (key: string, i: number) => {
+		if (!columnNames.includes(key)) {
+			throw new NodeOperationError(this.getNode(), 'Unexpected fields in node input', {
+				itemIndex: i,
+				description: `The input field '${key}' doesn't match any column in the Sheet. You can ignore this by changing the 'Handling extra data' field, which you can find under 'Options'.`,
+			});
+		}
+	};
+
+	const addNewColumn = (key: string) => {
+		if (!columnNames.includes(key)) {
+			newColumns.add(key);
+		}
+	};
 
 	const mappedValues: IDataObject[] = [];
 	for (let i = 0; i < items.length; i++) {
 		if (dataMode === 'nothing') continue;
 
-		const data: IDataObject[] = [];
+		const inputData: IDataObject[] = [];
 
 		if (dataMode === 'autoMapInputData') {
 			const handlingExtraDataOption = (options.handlingExtraData as string) || 'insertInNewColumn';
 			if (handlingExtraDataOption === 'ignoreIt') {
-				data.push(items[i].json);
+				inputData.push(items[i].json);
 			}
 			if (handlingExtraDataOption === 'error') {
-				Object.keys(items[i].json).forEach((key) => {
-					if (!columnNames.includes(key)) {
-						throw new NodeOperationError(this.getNode(), 'Unexpected fields in node input', {
-							itemIndex: i,
-							description: `The input field '${key}' doesn't match any column in the Sheet. You can ignore this by changing the 'Handling extra data' field, which you can find under 'Options'.`,
-						});
-					}
-				});
-				data.push(items[i].json);
+				Object.keys(items[i].json).forEach((key) => errorOnUnexpectedColumn(key, i));
+				inputData.push(items[i].json);
 			}
 			if (handlingExtraDataOption === 'insertInNewColumn') {
-				Object.keys(items[i].json).forEach((key) => {
-					if (!columnNames.includes(key)) {
-						newColumns.add(key);
-					}
-				});
-				data.push(items[i].json);
+				Object.keys(items[i].json).forEach(addNewColumn);
+				inputData.push(items[i].json);
 			}
 		} else {
 			const valueToMatchOn =
@@ -309,6 +350,7 @@ export async function execute(
 						"At least one value has to be added under 'Values to Send'",
 					);
 				}
+				// eslint-disable-next-line @typescript-eslint/no-loop-func
 				const fields = valuesToSend.reduce((acc, entry) => {
 					if (entry.column === 'newColumn') {
 						const columnName = entry.columnName as string;
@@ -322,7 +364,7 @@ export async function execute(
 					return acc;
 				}, {} as IDataObject);
 				fields[columnsToMatchOn[0]] = valueToMatchOn;
-				data.push(fields);
+				inputData.push(fields);
 			} else {
 				const mappingValues = this.getNodeParameter('columns.value', i) as IDataObject;
 				if (Object.keys(mappingValues).length === 0) {
@@ -337,56 +379,87 @@ export async function execute(
 						mappingValues[key] = '';
 					}
 				});
-				data.push(mappingValues);
+				inputData.push(mappingValues);
 				mappedValues.push(mappingValues);
 			}
 		}
 
 		if (newColumns.size) {
+			const newColumnNames = columnNames.concat([...newColumns]);
 			await sheet.updateRows(
 				sheetName,
-				[columnNames.concat([...newColumns])],
-				(options.cellFormat as ValueInputOption) || 'RAW',
-				headerRow + 1,
+				[newColumnNames],
+				(options.cellFormat as ValueInputOption) || cellFormatDefault(nodeVersion),
+				keyRowIndex + 1,
 			);
+			columnNames = newColumnNames;
+			sheetData[keyRowIndex] = newColumnNames;
+			newColumns.clear();
 		}
 
-		const preparedData = await sheet.prepareDataForUpdateOrUpsert(
-			data,
-			columnsToMatchOn[0],
+		const indexKey = columnsToMatchOn[0];
+
+		const preparedData = await sheet.prepareDataForUpdateOrUpsert({
+			inputData,
+			indexKey,
 			range,
-			headerRow,
-			firstDataRow,
+			keyRowIndex,
+			dataStartRowIndex,
 			valueRenderMode,
-			true,
-			[columnNames.concat([...newColumns])],
-			columnValues,
-		);
+			upsert: true,
+			columnNamesList: [columnNames.concat([...newColumns])],
+			columnValuesList,
+		});
 
 		updateData.push(...preparedData.updateData);
 		appendData.push(...preparedData.appendData);
 	}
 
+	const columnNamesList = [columnNames.concat([...newColumns])];
+
 	if (updateData.length) {
 		await sheet.batchUpdate(updateData, valueInputMode);
 	}
 	if (appendData.length) {
-		await sheet.appendEmptyRowsOrColumns(sheetId, 1, 0);
 		const lastRow = sheetData.length + 1;
-		await sheet.appendSheetData(
-			appendData,
-			range,
-			headerRow + 1,
-			valueInputMode,
-			false,
-			[columnNames.concat([...newColumns])],
-			lastRow,
-		);
+		const useAppend = options.useAppend as boolean;
+
+		if (options.useAppend) {
+			await sheet.appendSheetData({
+				inputData: appendData,
+				range,
+				keyRowIndex: keyRowIndex + 1,
+				valueInputMode,
+				columnNamesList,
+				lastRow,
+				useAppend,
+			});
+		} else {
+			await sheet.appendEmptyRowsOrColumns(sheetId, 1, 0);
+			await sheet.appendSheetData({
+				inputData: appendData,
+				range,
+				keyRowIndex: keyRowIndex + 1,
+				valueInputMode,
+				columnNamesList,
+				lastRow,
+			});
+		}
 	}
 
 	if (nodeVersion < 4 || dataMode === 'autoMapInputData') {
-		return items;
+		return items.map((item, index) => {
+			item.pairedItem = { item: index };
+			return item;
+		});
 	} else {
-		return this.helpers.returnJsonArray(mappedValues);
+		const returnData: INodeExecutionData[] = [];
+		for (const [index, entry] of mappedValues.entries()) {
+			returnData.push({
+				json: entry,
+				pairedItem: { item: index },
+			});
+		}
+		return returnData;
 	}
 }

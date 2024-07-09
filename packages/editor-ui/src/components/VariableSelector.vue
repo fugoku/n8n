@@ -1,24 +1,24 @@
 <template>
-	<div @keydown.stop class="variable-selector-wrapper">
+	<div class="variable-selector-wrapper" @keydown.stop>
 		<div class="input-wrapper">
 			<n8n-input
-				:placeholder="$locale.baseText('variableSelector.variableFilter')"
-				v-model="variableFilter"
 				ref="inputField"
+				v-model="variableFilter"
+				:placeholder="$locale.baseText('variableSelector.variableFilter')"
 				size="small"
 				type="text"
 			></n8n-input>
 		</div>
 
 		<div class="result-wrapper">
-			<variable-selector-item
-				:item="option"
+			<VariableSelectorItem
 				v-for="option in currentResults"
 				:key="option.key"
-				:extendAll="extendAll"
-				:redactValues="redactValues"
-				@itemSelected="forwardItemSelected"
-			></variable-selector-item>
+				:item="option"
+				:extend-all="extendAll"
+				:redact-values="redactValues"
+				@item-selected="forwardItemSelected"
+			></VariableSelectorItem>
 		</div>
 	</div>
 </template>
@@ -45,22 +45,30 @@ import { NodeConnectionType, WorkflowDataProxy } from 'n8n-workflow';
 import VariableSelectorItem from '@/components/VariableSelectorItem.vue';
 import type { INodeUi, IVariableItemSelected, IVariableSelectorOption } from '@/Interface';
 
-import { workflowHelpers } from '@/mixins/workflowHelpers';
-
 import { useWorkflowsStore } from '@/stores/workflows.store';
-import { useRootStore } from '@/stores/n8nRoot.store';
+import { useRootStore } from '@/stores/root.store';
 import { useNDVStore } from '@/stores/ndv.store';
+import { useRouter } from 'vue-router';
+import { useWorkflowHelpers } from '@/composables/useWorkflowHelpers';
+import { escapeMappingString } from '@/utils/mappingUtils';
 
 // Node types that should not be displayed in variable selector
 const SKIPPED_NODE_TYPES = [STICKY_NODE_TYPE];
 
 export default defineComponent({
 	name: 'VariableSelector',
-	mixins: [workflowHelpers],
 	components: {
 		VariableSelectorItem,
 	},
 	props: ['path', 'redactValues'],
+	setup() {
+		const router = useRouter();
+		const workflowHelpers = useWorkflowHelpers({ router });
+
+		return {
+			workflowHelpers,
+		};
+	},
 	data() {
 		return {
 			variableFilter: '',
@@ -74,7 +82,7 @@ export default defineComponent({
 			if (!activeNode) {
 				return null;
 			}
-			return this.getParentMainInputNode(this.getCurrentWorkflow(), activeNode);
+			return this.workflow.getParentMainInputNode(activeNode);
 		},
 		extendAll(): boolean {
 			if (this.variableFilter) {
@@ -87,7 +95,7 @@ export default defineComponent({
 			return this.getFilterResults(this.variableFilter.toLowerCase(), 0);
 		},
 		workflow(): Workflow {
-			return this.getCurrentWorkflow();
+			return this.workflowHelpers.getCurrentWorkflow();
 		},
 	},
 	methods: {
@@ -135,7 +143,7 @@ export default defineComponent({
 				return newItems;
 			}
 
-			if (inputData && inputData.options) {
+			if (inputData?.options) {
 				const newOptions = this.removeEmptyEntries(inputData.options);
 				if (Array.isArray(newOptions) && newOptions.length) {
 					// Has still options left so return
@@ -391,7 +399,9 @@ export default defineComponent({
 
 			// Get json data
 			if (outputData.hasOwnProperty('json')) {
-				const jsonPropertyPrefix = useShort === true ? '$json' : `$('${nodeName}').item.json`;
+				const jsonPropertyPrefix = useShort
+					? '$json'
+					: `$('${escapeMappingString(nodeName)}').item.json`;
 
 				const jsonDataOptions: IVariableSelectorOption[] = [];
 				for (const propertyName of Object.keys(outputData.json)) {
@@ -416,14 +426,16 @@ export default defineComponent({
 
 			// Get binary data
 			if (outputData.hasOwnProperty('binary')) {
-				const binaryPropertyPrefix = useShort === true ? '$binary' : `$('${nodeName}').item.binary`;
+				const binaryPropertyPrefix = useShort
+					? '$binary'
+					: `$('${escapeMappingString(nodeName)}').item.binary`;
 
 				const binaryData = [];
-				let binaryPropertyData = [];
+				let binaryPropertyData: IVariableSelectorOption[] = [];
 
-				for (const dataPropertyName of Object.keys(outputData.binary!)) {
+				for (const dataPropertyName of Object.keys(outputData.binary ?? {})) {
 					binaryPropertyData = [];
-					for (const propertyName in outputData.binary![dataPropertyName]) {
+					for (const propertyName in outputData.binary?.[dataPropertyName]) {
 						if (propertyName === 'data') {
 							continue;
 						}
@@ -436,7 +448,7 @@ export default defineComponent({
 						binaryPropertyData.push({
 							name: propertyName,
 							key: `${binaryPropertyPrefix}.${dataPropertyName}.${propertyName}`,
-							value: outputData.binary![dataPropertyName][propertyName],
+							value: outputData.binary?.[dataPropertyName][propertyName]?.toString(),
 						});
 					}
 
@@ -482,7 +494,7 @@ export default defineComponent({
 				parentNode[0],
 				inputName,
 			);
-			const connectionInputData = this.connectionInputData(
+			const connectionInputData = this.workflowHelpers.connectionInputData(
 				parentNode,
 				nodeName,
 				inputName,
@@ -499,6 +511,7 @@ export default defineComponent({
 					id: PLACEHOLDER_FILLED_AT_EXECUTION_TIME,
 					mode: 'test',
 					resumeUrl: PLACEHOLDER_FILLED_AT_EXECUTION_TIME,
+					resumeFormUrl: PLACEHOLDER_FILLED_AT_EXECUTION_TIME,
 				},
 
 				// deprecated
@@ -515,7 +528,6 @@ export default defineComponent({
 				connectionInputData,
 				{},
 				'manual',
-				this.rootStore.timezone,
 				additionalKeys,
 			);
 			const proxy = dataProxy.getDataProxy();
@@ -530,7 +542,7 @@ export default defineComponent({
 
 				returnData.push({
 					name: key,
-					key: `$('${nodeName}').context["${key}"]`,
+					key: `$('${escapeMappingString(nodeName)}').context['${escapeMappingString(key)}']`,
 					// @ts-ignore
 					value: nodeContext[key],
 				});
@@ -594,7 +606,6 @@ export default defineComponent({
 
 			const executionData = this.workflowsStore.getWorkflowExecution;
 			let parentNode = this.workflow.getParentNodes(this.activeNode.name, inputName, 1);
-			console.log('parentNode', parentNode);
 			let runData = this.workflowsStore.getWorkflowRunData;
 
 			if (runData === null) {
@@ -611,7 +622,7 @@ export default defineComponent({
 
 			let tempOptions: IVariableSelectorOption[];
 
-			if (executionData !== null && executionData.data !== undefined) {
+			if (executionData?.data !== undefined) {
 				const runExecutionData: IRunExecutionData = executionData.data;
 
 				tempOptions = this.getNodeContext(
@@ -787,12 +798,17 @@ export default defineComponent({
 					{
 						name: this.$locale.baseText('variableSelector.parameters'),
 						options: this.sortOptions(
-							this.getNodeParameters(nodeName, `$('${nodeName}').params`, undefined, filterText),
+							this.getNodeParameters(
+								nodeName,
+								`$('${escapeMappingString(nodeName)}').params`,
+								undefined,
+								filterText,
+							),
 						),
 					} as IVariableSelectorOption,
 				];
 
-				if (executionData !== null && executionData.data !== undefined) {
+				if (executionData?.data !== undefined) {
 					const runExecutionData: IRunExecutionData = executionData.data;
 
 					parentNode = this.workflow.getParentNodes(nodeName, inputName, 1);

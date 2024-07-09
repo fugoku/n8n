@@ -7,21 +7,19 @@ import type {
 } from 'n8n-workflow';
 import { NodeOperationError } from 'n8n-workflow';
 
+import { updateDisplayOptions } from '../../../utils/utilities';
 import { parseJsonParameter, composeReturnItem, resolveRawData } from './helpers/utils';
 import type { SetNodeOptions } from './helpers/interfaces';
-import { updateDisplayOptions } from '../../../utils/utilities';
 
 const properties: INodeProperties[] = [
 	{
-		displayName: 'JSON Output',
+		displayName: 'JSON',
 		name: 'jsonOutput',
-		type: 'string',
+		type: 'json',
 		typeOptions: {
-			editor: 'json',
-			editorLanguage: 'json',
 			rows: 5,
 		},
-		default: '{\n  "my_field_1": "value",\n  "my_field_2": 1\n}',
+		default: '{\n  "my_field_1": "value",\n  "my_field_2": 1\n}\n',
 		validateType: 'object',
 		ignoreValidationDuringExecution: true,
 	},
@@ -56,10 +54,10 @@ export async function execute(
 			);
 		}
 
-		return composeReturnItem.call(this, i, item, newData, options);
+		return composeReturnItem.call(this, i, item, newData, options, node.typeVersion);
 	} catch (error) {
-		if (this.continueOnFail()) {
-			return { json: { error: (error as Error).message } };
+		if (this.continueOnFail(error)) {
+			return { json: { error: (error as Error).message }, pairedItem: { item: i } };
 		}
 		throw new NodeOperationError(node, error as Error, {
 			itemIndex: i,

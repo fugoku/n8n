@@ -7,6 +7,7 @@ import {
 	faAngleLeft,
 	faAngleRight,
 	faAngleUp,
+	faArchive,
 	faArrowLeft,
 	faArrowRight,
 	faArrowUp,
@@ -74,10 +75,13 @@ import {
 	faGraduationCap,
 	faGripLinesVertical,
 	faGripVertical,
+	faHandHoldingUsd,
 	faHandScissors,
 	faHandPointLeft,
+	faHandshake,
 	faHashtag,
 	faHdd,
+	faHistory,
 	faHome,
 	faHourglass,
 	faImage,
@@ -93,6 +97,7 @@ import {
 	faMapSigns,
 	faMousePointer,
 	faNetworkWired,
+	faPalette,
 	faPause,
 	faPauseCircle,
 	faPen,
@@ -128,6 +133,8 @@ import {
 	faTerminal,
 	faThLarge,
 	faThumbtack,
+	faThumbsDown,
+	faThumbsUp,
 	faTimes,
 	faTimesCircle,
 	faToolbox,
@@ -149,6 +156,7 @@ import {
 	faTools,
 	faProjectDiagram,
 	faStream,
+	faPowerOff,
 } from '@fortawesome/free-solid-svg-icons';
 import { faVariable, faXmark, faVault } from './custom';
 import { faStickyNote } from '@fortawesome/free-regular-svg-icons';
@@ -158,13 +166,14 @@ function addIcon(icon: IconDefinition) {
 	library.add(icon);
 }
 
-export const FontAwesomePlugin: Plugin<{}> = {
+export const FontAwesomePlugin: Plugin = {
 	install: (app) => {
 		addIcon(faAngleDoubleLeft);
 		addIcon(faAngleDown);
 		addIcon(faAngleLeft);
 		addIcon(faAngleRight);
 		addIcon(faAngleUp);
+		addIcon(faArchive);
 		addIcon(faArrowLeft);
 		addIcon(faArrowRight);
 		addIcon(faArrowUp);
@@ -232,10 +241,13 @@ export const FontAwesomePlugin: Plugin<{}> = {
 		addIcon(faGlobe);
 		addIcon(faGlobeAmericas);
 		addIcon(faGraduationCap);
+		addIcon(faHandHoldingUsd);
 		addIcon(faHandScissors);
+		addIcon(faHandshake);
 		addIcon(faHandPointLeft);
 		addIcon(faHashtag);
 		addIcon(faHdd);
+		addIcon(faHistory);
 		addIcon(faHome);
 		addIcon(faHourglass);
 		addIcon(faImage);
@@ -251,6 +263,7 @@ export const FontAwesomePlugin: Plugin<{}> = {
 		addIcon(faMapSigns);
 		addIcon(faMousePointer);
 		addIcon(faNetworkWired);
+		addIcon(faPalette);
 		addIcon(faPause);
 		addIcon(faPauseCircle);
 		addIcon(faPen);
@@ -291,6 +304,8 @@ export const FontAwesomePlugin: Plugin<{}> = {
 		addIcon(faTerminal);
 		addIcon(faThLarge);
 		addIcon(faThumbtack);
+		addIcon(faThumbsDown);
+		addIcon(faThumbsUp);
 		addIcon(faTimes);
 		addIcon(faTimesCircle);
 		addIcon(faToolbox);
@@ -311,7 +326,8 @@ export const FontAwesomePlugin: Plugin<{}> = {
 		addIcon(faGem);
 		addIcon(faXmark);
 		addIcon(faDownload);
+		addIcon(faPowerOff);
 
-		app.component('font-awesome-icon', FontAwesomeIcon);
+		app.component('FontAwesomeIcon', FontAwesomeIcon);
 	},
 };

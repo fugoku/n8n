@@ -1,30 +1,30 @@
 import { Container } from 'typedi';
+import { GlobalConfig } from '@n8n/config';
 import { readFileSync, rmSync } from 'fs';
-import { UserSettings } from 'n8n-core';
-import type { ObjectLiteral } from 'typeorm';
-import type { QueryRunner } from 'typeorm/query-runner/QueryRunner';
-import { jsonParse } from 'n8n-workflow';
-import config from '@/config';
+import { InstanceSettings } from 'n8n-core';
+import type { ObjectLiteral } from '@n8n/typeorm';
+import type { QueryRunner } from '@n8n/typeorm/query-runner/QueryRunner';
+import { ApplicationError, jsonParse } from 'n8n-workflow';
+
 import { inTest } from '@/constants';
 import type { BaseMigration, Migration, MigrationContext, MigrationFn } from '@db/types';
 import { createSchemaBuilder } from '@db/dsl';
-import { getLogger } from '@/Logger';
 import { NodeTypes } from '@/NodeTypes';
-
-const logger = getLogger();
+import { Logger } from '@/Logger';
 
 const PERSONALIZATION_SURVEY_FILENAME = 'personalizationSurvey.json';
 
 function loadSurveyFromDisk(): string | null {
-	const userSettingsPath = UserSettings.getUserN8nFolderPath();
 	try {
-		const filename = `${userSettingsPath}/${PERSONALIZATION_SURVEY_FILENAME}`;
+		const filename = `${
+			Container.get(InstanceSettings).n8nFolder
+		}/${PERSONALIZATION_SURVEY_FILENAME}`;
 		const surveyFile = readFileSync(filename, 'utf-8');
 		rmSync(filename);
 		const personalizationSurvey = JSON.parse(surveyFile) as object;
 		const kvPairs = Object.entries(personalizationSurvey);
 		if (!kvPairs.length) {
-			throw new Error('personalizationSurvey is empty');
+			throw new ApplicationError('personalizationSurvey is empty');
 		} else {
 			const emptyKeys = kvPairs.reduce((acc, [, value]) => {
 				if (!value || (Array.isArray(value) && !value.length)) {
@@ -33,7 +33,7 @@ function loadSurveyFromDisk(): string | null {
 				return acc;
 			}, 0);
 			if (emptyKeys === kvPairs.length) {
-				throw new Error('incomplete personalizationSurvey');
+				throw new ApplicationError('incomplete personalizationSurvey');
 			}
 		}
 		return surveyFile;
@@ -47,18 +47,20 @@ let runningMigrations = false;
 function logMigrationStart(migrationName: string): void {
 	if (inTest) return;
 
+	const logger = Container.get(Logger);
 	if (!runningMigrations) {
 		logger.warn('Migrations in progress, please do NOT stop the process.');
 		runningMigrations = true;
 	}
 
-	logger.debug(`Starting migration ${migrationName}`);
+	logger.info(`Starting migration ${migrationName}`);
 }
 
 function logMigrationEnd(migrationName: string): void {
 	if (inTest) return;
 
-	logger.debug(`Finished migration ${migrationName}`);
+	const logger = Container.get(Logger);
+	logger.info(`Finished migration ${migrationName}`);
 }
 
 const runDisablingForeignKeys = async (
@@ -67,7 +69,8 @@ const runDisablingForeignKeys = async (
 	fn: MigrationFn,
 ) => {
 	const { dbType, queryRunner } = context;
-	if (dbType !== 'sqlite') throw new Error('Disabling transactions only available in sqlite');
+	if (dbType !== 'sqlite')
+		throw new ApplicationError('Disabling transactions only available in sqlite');
 	await queryRunner.query('PRAGMA foreign_keys=OFF');
 	await queryRunner.startTransaction();
 	try {
@@ -87,13 +90,14 @@ function parseJson<T>(data: string | T): T {
 	return typeof data === 'string' ? jsonParse<T>(data) : data;
 }
 
-const dbType = config.getEnv('database.type');
+const globalConfig = Container.get(GlobalConfig);
+const dbType = globalConfig.database.type;
 const isMysql = ['mariadb', 'mysqldb'].includes(dbType);
-const dbName = config.getEnv(`database.${dbType === 'mariadb' ? 'mysqldb' : dbType}.database`);
-const tablePrefix = config.getEnv('database.tablePrefix');
+const dbName = globalConfig.database[dbType === 'mariadb' ? 'mysqldb' : dbType].database;
+const tablePrefix = globalConfig.database.tablePrefix;
 
 const createContext = (queryRunner: QueryRunner, migration: Migration): MigrationContext => ({
-	logger,
+	logger: Container.get(Logger),
 	tablePrefix,
 	dbType,
 	isMysql,
@@ -109,20 +113,16 @@ const createContext = (queryRunner: QueryRunner, migration: Migration): Migratio
 		tableName: (name) => queryRunner.connection.driver.escape(`${tablePrefix}${name}`),
 		indexName: (name) => queryRunner.connection.driver.escape(`IDX_${tablePrefix}${name}`),
 	},
-	runQuery: async <T>(
-		sql: string,
-		unsafeParameters?: ObjectLiteral,
-		safeParameters?: ObjectLiteral,
-	) => {
-		if (unsafeParameters) {
+	runQuery: async <T>(sql: string, namedParameters?: ObjectLiteral) => {
+		if (namedParameters) {
 			const [query, parameters] = queryRunner.connection.driver.escapeQueryWithParameters(
 				sql,
-				unsafeParameters,
-				safeParameters ?? {},
+				namedParameters,
+				{},
 			);
-			return queryRunner.query(query, parameters) as Promise<T>;
+			return await (queryRunner.query(query, parameters) as Promise<T>);
 		} else {
-			return queryRunner.query(sql) as Promise<T>;
+			return await (queryRunner.query(sql) as Promise<T>);
 		}
 	},
 	runInBatches: async <T>(
@@ -178,26 +178,32 @@ const createContext = (queryRunner: QueryRunner, migration: Migration): Migratio
 
 export const wrapMigration = (migration: Migration) => {
 	const { up, down } = migration.prototype;
-	Object.assign(migration.prototype, {
-		async up(this: BaseMigration, queryRunner: QueryRunner) {
-			logMigrationStart(migration.name);
-			const context = createContext(queryRunner, migration);
-			if (this.transaction === false) {
-				await runDisablingForeignKeys(this, context, up);
-			} else {
-				await up.call(this, context);
-			}
-			logMigrationEnd(migration.name);
-		},
-		async down(this: BaseMigration, queryRunner: QueryRunner) {
-			if (down) {
+	if (up) {
+		Object.assign(migration.prototype, {
+			async up(this: BaseMigration, queryRunner: QueryRunner) {
+				logMigrationStart(migration.name);
 				const context = createContext(queryRunner, migration);
 				if (this.transaction === false) {
 					await runDisablingForeignKeys(this, context, up);
 				} else {
+					await up.call(this, context);
+				}
+				logMigrationEnd(migration.name);
+			},
+		});
+	} else {
+		throw new ApplicationError(`Migration "${migration.name}" is missing the method \`up\`.`);
+	}
+	if (down) {
+		Object.assign(migration.prototype, {
+			async down(this: BaseMigration, queryRunner: QueryRunner) {
+				const context = createContext(queryRunner, migration);
+				if (this.transaction === false) {
+					await runDisablingForeignKeys(this, context, down);
+				} else {
 					await down.call(this, context);
 				}
-			}
-		},
-	});
+			},
+		});
+	}
 };

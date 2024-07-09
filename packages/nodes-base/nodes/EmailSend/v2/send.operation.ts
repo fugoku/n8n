@@ -51,14 +51,17 @@ const properties: INodeProperties[] = [
 			{
 				name: 'Text',
 				value: 'text',
+				description: 'Send email as plain text',
 			},
 			{
 				name: 'HTML',
 				value: 'html',
+				description: 'Send email as HTML',
 			},
 			{
 				name: 'Both',
 				value: 'both',
+				description: "Send both formats, recipient's client selects version to display",
 			},
 		],
 		default: 'html',
@@ -207,6 +210,10 @@ function configureTransport(credentials: IDataObject, options: EmailSendOptions)
 		secure: credentials.secure as boolean,
 	};
 
+	if (typeof credentials.hostName === 'string' && credentials.hostName) {
+		connectionOptions.name = credentials.hostName;
+	}
+
 	if (credentials.user || credentials.password) {
 		connectionOptions.auth = {
 			user: credentials.user as string,
@@ -226,7 +233,7 @@ function configureTransport(credentials: IDataObject, options: EmailSendOptions)
 export async function execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 	const items = this.getInputData();
 	const nodeVersion = this.getNode().typeVersion;
-	const instanceId = await this.getInstanceId();
+	const instanceId = this.getInstanceId();
 
 	const returnData: INodeExecutionData[] = [];
 	let item: INodeExecutionData;
@@ -282,9 +289,7 @@ export async function execute(this: IExecuteFunctions): Promise<INodeExecutionDa
 					<em>${attributionText}<a href="${link}" target="_blank">n8n</a></em>
 					`;
 				} else {
-					mailOptions.text = `${
-						mailOptions.text
-					}\n\n---\n${attributionText}n8n\n${'https://n8n.io'}`;
+					mailOptions.text = `${mailOptions.text}\n\n---\n${attributionText}n8n\n${'https://n8n.io'}`;
 				}
 			}
 
@@ -319,7 +324,7 @@ export async function execute(this: IExecuteFunctions): Promise<INodeExecutionDa
 				},
 			});
 		} catch (error) {
-			if (this.continueOnFail()) {
+			if (this.continueOnFail(error)) {
 				returnData.push({
 					json: {
 						error: error.message,

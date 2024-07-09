@@ -7,7 +7,7 @@ import type {
 	WorkflowVersionId,
 	WorkflowHistoryActionTypes,
 } from '@/types/workflowHistory';
-import { useI18n } from '@/composables';
+import { useI18n } from '@/composables/useI18n';
 
 const props = defineProps<{
 	item: WorkflowHistory;
@@ -16,24 +16,29 @@ const props = defineProps<{
 	isActive: boolean;
 }>();
 const emit = defineEmits<{
-	(
-		event: 'action',
-		value: { action: WorkflowHistoryActionTypes[number]; id: WorkflowVersionId },
-	): void;
-	(event: 'preview', value: { event: MouseEvent; id: WorkflowVersionId }): void;
-	(event: 'mounted', value: { index: number; offsetTop: number; isActive: boolean }): void;
+	action: [
+		value: {
+			action: WorkflowHistoryActionTypes[number];
+			id: WorkflowVersionId;
+			data: { formattedCreatedAt: string };
+		},
+	];
+	preview: [value: { event: MouseEvent; id: WorkflowVersionId }];
+	mounted: [value: { index: number; offsetTop: number; isActive: boolean }];
 }>();
 
 const i18n = useI18n();
 
 const actionsVisible = ref(false);
 const itemElement = ref<HTMLElement | null>(null);
+const authorElement = ref<HTMLElement | null>(null);
+const isAuthorElementTruncated = ref(false);
 
-const formattedCreatedAtDate = computed<string>(() => {
+const formattedCreatedAt = computed<string>(() => {
 	const currentYear = new Date().getFullYear().toString();
 	const [date, time] = dateformat(
 		props.item.createdAt,
-		`${props.item.createdAt.startsWith(currentYear) ? '' : 'yyyy '} mmm d"#"HH:MM`,
+		`${props.item.createdAt.startsWith(currentYear) ? '' : 'yyyy '}mmm d"#"HH:MM:ss`,
 	).split('#');
 
 	return i18n.baseText('workflowHistory.item.createdAt', { interpolate: { date, time } });
@@ -58,7 +63,11 @@ const idLabel = computed<string>(() =>
 );
 
 const onAction = (action: WorkflowHistoryActionTypes[number]) => {
-	emit('action', { action, id: props.item.versionId });
+	emit('action', {
+		action,
+		id: props.item.versionId,
+		data: { formattedCreatedAt: formattedCreatedAt.value },
+	});
 };
 
 const onVisibleChange = (visible: boolean) => {
@@ -75,6 +84,8 @@ onMounted(() => {
 		offsetTop: itemElement.value?.offsetTop ?? 0,
 		isActive: props.isActive,
 	});
+	isAuthorElementTruncated.value =
+		(authorElement.value?.scrollWidth ?? 0) > (authorElement.value?.clientWidth ?? 0);
 });
 </script>
 <template>
@@ -87,14 +98,19 @@ onMounted(() => {
 			[$style.actionsVisible]: actionsVisible,
 		}"
 	>
-		<p @click="onItemClick">
-			<time :datetime="item.createdAt">{{ formattedCreatedAtDate }}</time>
-			<n8n-tooltip placement="right-end" :disabled="authors.size < 2">
-				<template #content>{{ props.item.authors }}</template>
-				<span>{{ authors.label }}</span>
-			</n8n-tooltip>
-			<data :value="item.versionId">{{ idLabel }}</data>
-		</p>
+		<slot :formatted-created-at="formattedCreatedAt">
+			<p @click="onItemClick">
+				<time :datetime="item.createdAt">{{ formattedCreatedAt }}</time>
+				<n8n-tooltip
+					placement="right-end"
+					:disabled="authors.size < 2 && !isAuthorElementTruncated"
+				>
+					<template #content>{{ props.item.authors }}</template>
+					<span ref="authorElement">{{ authors.label }}</span>
+				</n8n-tooltip>
+				<data :value="item.versionId">{{ idLabel }}</data>
+			</p>
+		</slot>
 		<div :class="$style.tail">
 			<n8n-badge v-if="props.index === 0">
 				{{ i18n.baseText('workflowHistory.item.latest') }}
@@ -103,10 +119,13 @@ onMounted(() => {
 				theme="dark"
 				:class="$style.actions"
 				:actions="props.actions"
+				placement="bottom-end"
 				@action="onAction"
 				@click.stop
 				@visible-change="onVisibleChange"
-			/>
+			>
+				<slot name="action-toggle-button" />
+			</n8n-action-toggle>
 		</div>
 	</li>
 </template>
@@ -124,26 +143,24 @@ onMounted(() => {
 	p {
 		display: grid;
 		padding: var(--spacing-s);
-		line-height: unset;
 		cursor: pointer;
+		flex: 1 1 auto;
 
 		time {
-			padding: 0 0 var(--spacing-2xs);
+			padding: 0 0 var(--spacing-5xs);
 			color: var(--color-text-dark);
 			font-size: var(--font-size-s);
 			font-weight: var(--font-weight-bold);
 		}
 
-		span {
-			justify-self: start;
-		}
-
+		span,
 		data {
+			justify-self: start;
 			max-width: 160px;
 			white-space: nowrap;
 			overflow: hidden;
 			text-overflow: ellipsis;
-			padding-top: var(--spacing-4xs);
+			margin-top: calc(var(--spacing-4xs) * -1);
 			font-size: var(--font-size-2xs);
 		}
 	}

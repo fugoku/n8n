@@ -13,6 +13,8 @@ import type {
 } from 'n8n-workflow';
 import { NodeOperationError } from 'n8n-workflow';
 
+import { getGoogleAccessToken } from '../../GenericFunctions';
+import { generatePairedItemData } from '../../../../utils/utilities';
 import type {
 	ILookupValues,
 	ISheetUpdateData,
@@ -25,7 +27,6 @@ import { GoogleSheet } from './GoogleSheet';
 import { googleApiRequest, hexToRgb } from './GenericFunctions';
 
 import { versionDescription } from './versionDescription';
-import { getGoogleAccessToken } from '../../GenericFunctions';
 
 export class GoogleSheetsV1 implements INodeType {
 	description: INodeTypeDescription;
@@ -143,7 +144,7 @@ export class GoogleSheetsV1 implements INodeType {
 
 					return [items];
 				} catch (error) {
-					if (this.continueOnFail()) {
+					if (this.continueOnFail(error)) {
 						return [[{ json: { error: error.message } }]];
 					}
 					throw error;
@@ -158,7 +159,7 @@ export class GoogleSheetsV1 implements INodeType {
 					const items = this.getInputData();
 					return [items];
 				} catch (error) {
-					if (this.continueOnFail()) {
+					if (this.continueOnFail(error)) {
 						return [[{ json: { error: error.message } }]];
 					}
 					throw error;
@@ -200,7 +201,7 @@ export class GoogleSheetsV1 implements INodeType {
 						}
 						returnData.push(responseData as IDataObject);
 					} catch (error) {
-						if (this.continueOnFail()) {
+						if (this.continueOnFail(error)) {
 							returnData.push({ error: error.message });
 							continue;
 						}
@@ -247,7 +248,7 @@ export class GoogleSheetsV1 implements INodeType {
 					const items = this.getInputData();
 					return [items];
 				} catch (error) {
-					if (this.continueOnFail()) {
+					if (this.continueOnFail(error)) {
 						return [[{ json: { error: error.message } }]];
 					}
 					throw error;
@@ -295,9 +296,18 @@ export class GoogleSheetsV1 implements INodeType {
 						returnData = [];
 					}
 
-					return [this.helpers.returnJsonArray(returnData)];
+					const pairedItem = generatePairedItemData(items.length);
+
+					const lookupOutput = returnData.map((item) => {
+						return {
+							json: item,
+							pairedItem,
+						};
+					});
+
+					return [lookupOutput];
 				} catch (error) {
-					if (this.continueOnFail()) {
+					if (this.continueOnFail(error)) {
 						return [this.helpers.returnJsonArray({ error: error.message })];
 					}
 					throw error;
@@ -334,7 +344,7 @@ export class GoogleSheetsV1 implements INodeType {
 
 					return [this.helpers.returnJsonArray(returnData)];
 				} catch (error) {
-					if (this.continueOnFail()) {
+					if (this.continueOnFail(error)) {
 						return [this.helpers.returnJsonArray({ error: error.message })];
 					}
 					throw error;
@@ -365,7 +375,7 @@ export class GoogleSheetsV1 implements INodeType {
 						delete responseData.replies;
 						returnData.push(responseData as IDataObject);
 					} catch (error) {
-						if (this.continueOnFail()) {
+						if (this.continueOnFail(error)) {
 							returnData.push({ error: error.message });
 							continue;
 						}
@@ -422,7 +432,7 @@ export class GoogleSheetsV1 implements INodeType {
 
 					return [items];
 				} catch (error) {
-					if (this.continueOnFail()) {
+					if (this.continueOnFail(error)) {
 						return [[{ json: { error: error.message } }]];
 					}
 					throw error;
@@ -478,7 +488,7 @@ export class GoogleSheetsV1 implements INodeType {
 
 						returnData.push(responseData as IDataObject);
 					} catch (error) {
-						if (this.continueOnFail()) {
+						if (this.continueOnFail(error)) {
 							returnData.push({ error: error.message });
 							continue;
 						}

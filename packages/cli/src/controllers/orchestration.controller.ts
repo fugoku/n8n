@@ -1,32 +1,38 @@
-import { Authorized, Get, RestController } from '@/decorators';
+import { Post, RestController, GlobalScope } from '@/decorators';
 import { OrchestrationRequest } from '@/requests';
-import { Service } from 'typedi';
 import { OrchestrationService } from '@/services/orchestration.service';
+import { License } from '@/License';
 
-@Authorized(['global', 'owner'])
 @RestController('/orchestration')
-@Service()
 export class OrchestrationController {
-	constructor(private readonly orchestrationService: OrchestrationService) {}
+	constructor(
+		private readonly orchestrationService: OrchestrationService,
+		private readonly licenseService: License,
+	) {}
 
 	/**
-	 * These endpoint currently do not return anything, they just trigger the messsage to
+	 * These endpoints do not return anything, they just trigger the message to
 	 * the workers to respond on Redis with their status.
-	 * TODO: these responses need to be forwarded to and handled by the frontend
 	 */
-	@Get('/worker/status/:id')
+	@GlobalScope('orchestration:read')
+	@Post('/worker/status/:id')
 	async getWorkersStatus(req: OrchestrationRequest.Get) {
+		if (!this.licenseService.isWorkerViewLicensed()) return;
 		const id = req.params.id;
-		return this.orchestrationService.getWorkerStatus(id);
+		return await this.orchestrationService.getWorkerStatus(id);
 	}
 
-	@Get('/worker/status')
+	@GlobalScope('orchestration:read')
+	@Post('/worker/status')
 	async getWorkersStatusAll() {
-		return this.orchestrationService.getWorkerStatus();
+		if (!this.licenseService.isWorkerViewLicensed()) return;
+		return await this.orchestrationService.getWorkerStatus();
 	}
 
-	@Get('/worker/ids')
+	@GlobalScope('orchestration:list')
+	@Post('/worker/ids')
 	async getWorkerIdsAll() {
-		return this.orchestrationService.getWorkerIds();
+		if (!this.licenseService.isWorkerViewLicensed()) return;
+		return await this.orchestrationService.getWorkerIds();
 	}
 }

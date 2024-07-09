@@ -1,28 +1,22 @@
-import { SettingsRepository } from '@/databases/repositories';
+import { SettingsRepository } from '@db/repositories/settings.repository';
 import type {
 	ExternalSecretsSettings,
 	SecretsProvider,
 	SecretsProviderSettings,
 } from '@/Interfaces';
 
-import { UserSettings } from 'n8n-core';
+import { Cipher } from 'n8n-core';
 import Container, { Service } from 'typedi';
 
-import { AES, enc } from 'crypto-js';
-import { getLogger } from '@/Logger';
+import { Logger } from '@/Logger';
 
-import type { IDataObject } from 'n8n-workflow';
-import {
-	EXTERNAL_SECRETS_INITIAL_BACKOFF,
-	EXTERNAL_SECRETS_MAX_BACKOFF,
-	EXTERNAL_SECRETS_UPDATE_INTERVAL,
-} from './constants';
+import { jsonParse, type IDataObject, ApplicationError } from 'n8n-workflow';
+import { EXTERNAL_SECRETS_INITIAL_BACKOFF, EXTERNAL_SECRETS_MAX_BACKOFF } from './constants';
 import { License } from '@/License';
 import { InternalHooks } from '@/InternalHooks';
+import { updateIntervalTime } from './externalSecretsHelper.ee';
 import { ExternalSecretsProviders } from './ExternalSecretsProviders.ee';
 import { OrchestrationService } from '@/services/orchestration.service';
-
-const logger = getLogger();
 
 @Service()
 export class ExternalSecretsManager {
@@ -39,9 +33,11 @@ export class ExternalSecretsManager {
 	initRetryTimeouts: Record<string, NodeJS.Timer> = {};
 
 	constructor(
-		private settingsRepo: SettingsRepository,
-		private license: License,
-		private secretsProviders: ExternalSecretsProviders,
+		private readonly logger: Logger,
+		private readonly settingsRepo: SettingsRepository,
+		private readonly license: License,
+		private readonly secretsProviders: ExternalSecretsProviders,
+		private readonly cipher: Cipher,
 	) {}
 
 	async init(): Promise<void> {
@@ -53,12 +49,12 @@ export class ExternalSecretsManager {
 					resolve();
 					this.initializingPromise = undefined;
 					this.updateInterval = setInterval(
-						async () => this.updateSecrets(),
-						EXTERNAL_SECRETS_UPDATE_INTERVAL,
+						async () => await this.updateSecrets(),
+						updateIntervalTime(),
 					);
 				});
 			}
-			return this.initializingPromise;
+			return await this.initializingPromise;
 		}
 	}
 
@@ -72,7 +68,7 @@ export class ExternalSecretsManager {
 	}
 
 	async reloadAllProviders(backoff?: number) {
-		logger.debug('Reloading all external secrets providers');
+		this.logger.debug('Reloading all external secrets providers');
 		const providers = this.getProviderNames();
 		if (!providers) {
 			return;
@@ -83,20 +79,15 @@ export class ExternalSecretsManager {
 	}
 
 	async broadcastReloadExternalSecretsProviders() {
-		await Container.get(OrchestrationService).broadcastReloadExternalSecretsProviders();
+		await Container.get(OrchestrationService).publish('reloadExternalSecretsProviders');
 	}
 
-	private async getEncryptionKey(): Promise<string> {
-		return UserSettings.getEncryptionKey();
-	}
-
-	private decryptSecretsSettings(value: string, encryptionKey: string): ExternalSecretsSettings {
-		const decryptedData = AES.decrypt(value, encryptionKey);
-
+	private decryptSecretsSettings(value: string): ExternalSecretsSettings {
+		const decryptedData = this.cipher.decrypt(value);
 		try {
-			return JSON.parse(decryptedData.toString(enc.Utf8)) as ExternalSecretsSettings;
+			return jsonParse(decryptedData);
 		} catch (e) {
-			throw new Error(
+			throw new ApplicationError(
 				'External Secrets Settings could not be decrypted. The likely reason is that a different "encryptionKey" was used to encrypt the data.',
 			);
 		}
@@ -109,8 +100,7 @@ export class ExternalSecretsManager {
 		if (encryptedSettings === null) {
 			return null;
 		}
-		const encryptionKey = await this.getEncryptionKey();
-		return this.decryptSecretsSettings(encryptedSettings, encryptionKey);
+		return this.decryptSecretsSettings(encryptedSettings);
 	}
 
 	private async internalInit() {
@@ -120,13 +110,13 @@ export class ExternalSecretsManager {
 		}
 		const providers: Array<SecretsProvider | null> = (
 			await Promise.allSettled(
-				Object.entries(settings).map(async ([name, providerSettings]) =>
-					this.initProvider(name, providerSettings),
+				Object.entries(settings).map(
+					async ([name, providerSettings]) => await this.initProvider(name, providerSettings),
 				),
 			)
 		).map((i) => (i.status === 'rejected' ? null : i.value));
 		this.providers = Object.fromEntries(
-			(providers.filter((p) => p !== null) as SecretsProvider[]).map((s) => [s.name, s]),
+			providers.filter((p): p is SecretsProvider => p !== null).map((s) => [s.name, s]),
 		);
 		this.cachedSettings = settings;
 		await this.updateSecrets();
@@ -146,7 +136,7 @@ export class ExternalSecretsManager {
 		try {
 			await provider.init(providerSettings);
 		} catch (e) {
-			logger.error(
+			this.logger.error(
 				`Error initializing secrets provider ${provider.displayName} (${provider.name}).`,
 			);
 			this.retryInitWithBackoff(name, currentBackoff);
@@ -161,7 +151,7 @@ export class ExternalSecretsManager {
 			try {
 				await provider.disconnect();
 			} catch {}
-			logger.error(
+			this.logger.error(
 				`Error initializing secrets provider ${provider.displayName} (${provider.name}).`,
 			);
 			this.retryInitWithBackoff(name, currentBackoff);
@@ -196,7 +186,7 @@ export class ExternalSecretsManager {
 						await p.update();
 					}
 				} catch {
-					logger.error(`Error updating secrets provider ${p.displayName} (${p.name}).`);
+					this.logger.error(`Error updating secrets provider ${p.displayName} (${p.name}).`);
 				}
 			}),
 		);
@@ -214,7 +204,7 @@ export class ExternalSecretsManager {
 		return Object.keys(this.providers);
 	}
 
-	getSecret(provider: string, name: string): IDataObject | undefined {
+	getSecret(provider: string, name: string) {
 		return this.getProvider(provider)?.getSecret(name);
 	}
 
@@ -327,13 +317,12 @@ export class ExternalSecretsManager {
 		});
 	}
 
-	encryptSecretsSettings(settings: ExternalSecretsSettings, encryptionKey: string): string {
-		return AES.encrypt(JSON.stringify(settings), encryptionKey).toString();
+	private encryptSecretsSettings(settings: ExternalSecretsSettings): string {
+		return this.cipher.encrypt(settings);
 	}
 
 	async saveAndSetSettings(settings: ExternalSecretsSettings, settingsRepo: SettingsRepository) {
-		const encryptionKey = await this.getEncryptionKey();
-		const encryptedSettings = this.encryptSecretsSettings(settings, encryptionKey);
+		const encryptedSettings = this.encryptSecretsSettings(settings);
 		await settingsRepo.saveEncryptedSecretsProviderSettings(encryptedSettings);
 	}
 

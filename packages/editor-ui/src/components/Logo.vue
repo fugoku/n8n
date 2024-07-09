@@ -5,19 +5,17 @@
 <script lang="ts">
 import { defineComponent } from 'vue';
 import { mapStores } from 'pinia';
-import { useRootStore, useSettingsStore } from '@/stores';
+import { useRootStore } from '@/stores/root.store';
+import { useUIStore } from '@/stores/ui.store';
 
 export default defineComponent({
 	computed: {
-		...mapStores(useRootStore, useSettingsStore),
+		...mapStores(useRootStore, useUIStore),
 		basePath(): string {
 			return this.rootStore.baseUrl;
 		},
 		logoPath(): string {
-			return (
-				this.basePath +
-				(this.settingsStore.settings.isBetaRelease ? 'n8n-beta-logo.svg' : 'n8n-logo-expanded.svg')
-			);
+			return this.basePath + this.uiStore.logo;
 		},
 	},
 });

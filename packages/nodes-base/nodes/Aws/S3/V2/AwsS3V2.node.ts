@@ -1,7 +1,7 @@
 /* eslint-disable n8n-nodes-base/node-filename-against-convention */
-import { paramCase, snakeCase } from 'change-case';
-
 import { createHash } from 'crypto';
+import type { Readable } from 'stream';
+import { paramCase, snakeCase } from 'change-case';
 
 import { Builder } from 'xml2js';
 
@@ -22,7 +22,6 @@ import { folderFields, folderOperations } from './FolderDescription';
 import { fileFields, fileOperations } from './FileDescription';
 
 import { awsApiRequestREST, awsApiRequestRESTAllItems } from './GenericFunctions';
-import type { Readable } from 'stream';
 
 // Minimum size 5MB for multipart upload in S3
 const UPLOAD_CHUNK_SIZE = 5120 * 1024;
@@ -301,7 +300,7 @@ export class AwsS3V2 implements INodeType {
 							headers['x-amz-request-payer'] = 'requester';
 						}
 						if (additionalFields.parentFolderKey) {
-							path = `/${additionalFields.parentFolderKey}${folderName}/`;
+							path = `${basePath}/${additionalFields.parentFolderKey}/${folderName}/`;
 						}
 						if (additionalFields.storageClass) {
 							headers['x-amz-storage-class'] = snakeCase(
@@ -779,7 +778,7 @@ export class AwsS3V2 implements INodeType {
 						const additionalFields = this.getNodeParameter('additionalFields', i);
 						const tagsValues = (this.getNodeParameter('tagsUi', i) as IDataObject)
 							.tagsValues as IDataObject[];
-						let path = `${basePath}/`;
+						let path = `${basePath}/${fileName}`;
 						let body;
 
 						const multipartHeaders: IDataObject = {};
@@ -789,9 +788,7 @@ export class AwsS3V2 implements INodeType {
 							neededHeaders['x-amz-request-payer'] = 'requester';
 						}
 						if (additionalFields.parentFolderKey) {
-							path = `${additionalFields.parentFolderKey}/${fileName}`;
-						} else {
-							path = `${fileName}`;
+							path = `${basePath}/${additionalFields.parentFolderKey}/${fileName}`;
 						}
 						if (additionalFields.storageClass) {
 							multipartHeaders['x-amz-storage-class'] = snakeCase(
@@ -878,7 +875,7 @@ export class AwsS3V2 implements INodeType {
 									this,
 									servicePath,
 									'POST',
-									`/${path}?uploads`,
+									`${path}?uploads`,
 									body,
 									qs,
 									{ ...neededHeaders, ...multipartHeaders },
@@ -900,7 +897,7 @@ export class AwsS3V2 implements INodeType {
 											this,
 											servicePath,
 											'PUT',
-											`/${path}?partNumber=${part}&uploadId=${uploadId}`,
+											`${path}?partNumber=${part}&uploadId=${uploadId}`,
 											chunk,
 											qs,
 											listHeaders,
@@ -914,7 +911,7 @@ export class AwsS3V2 implements INodeType {
 												this,
 												servicePath,
 												'DELETE',
-												`/${path}?uploadId=${uploadId}`,
+												`${path}?uploadId=${uploadId}`,
 											);
 										} catch (err) {
 											throw new NodeOperationError(this.getNode(), err as Error);
@@ -927,7 +924,7 @@ export class AwsS3V2 implements INodeType {
 									this,
 									servicePath,
 									'GET',
-									`/${path}?max-parts=${900}&part-number-marker=0&uploadId=${uploadId}`,
+									`${path}?max-parts=${900}&part-number-marker=0&uploadId=${uploadId}`,
 									'',
 									qs,
 									{ ...neededHeaders },
@@ -979,7 +976,7 @@ export class AwsS3V2 implements INodeType {
 									this,
 									servicePath,
 									'POST',
-									`/${path}?uploadId=${uploadId}`,
+									`${path}?uploadId=${uploadId}`,
 									data,
 									qs,
 									{
@@ -1016,7 +1013,7 @@ export class AwsS3V2 implements INodeType {
 									this,
 									servicePath,
 									'PUT',
-									`/${path || binaryPropertyData.fileName}`,
+									path,
 									body,
 									qs,
 									headers,
@@ -1025,7 +1022,7 @@ export class AwsS3V2 implements INodeType {
 								);
 							}
 							const executionData = this.helpers.constructExecutionMetaData(
-								this.helpers.returnJsonArray(responseData as IDataObject),
+								this.helpers.returnJsonArray(responseData ?? { success: true }),
 								{ itemData: { item: i } },
 							);
 							returnData.push(...executionData);
@@ -1044,7 +1041,7 @@ export class AwsS3V2 implements INodeType {
 								this,
 								servicePath,
 								'PUT',
-								`/${path}`,
+								path,
 								body,
 								qs,
 								{ ...headers },
@@ -1060,7 +1057,7 @@ export class AwsS3V2 implements INodeType {
 					}
 				}
 			} catch (error) {
-				if (this.continueOnFail()) {
+				if (this.continueOnFail(error)) {
 					const executionData = this.helpers.constructExecutionMetaData(
 						this.helpers.returnJsonArray({ error: error.message }),
 						{ itemData: { item: i } },

@@ -1,49 +1,82 @@
-import { jsonStringify, LoggerProxy as Logger } from 'n8n-workflow';
+import { assert, jsonStringify } from 'n8n-workflow';
 import type { IPushDataType } from '@/Interfaces';
+import type { Logger } from '@/Logger';
 
+/**
+ * Abstract class for two-way push communication.
+ * Keeps track of user sessions and enables sending messages.
+ *
+ * @emits message when a message is received from a client
+ */
 export abstract class AbstractPush<T> {
 	protected connections: Record<string, T> = {};
 
 	protected abstract close(connection: T): void;
-	protected abstract sendToOne(connection: T, data: string): void;
+	protected abstract sendToOneConnection(connection: T, data: string): void;
 
-	protected add(sessionId: string, connection: T): void {
+	constructor(protected readonly logger: Logger) {}
+
+	protected add(pushRef: string, connection: T) {
 		const { connections } = this;
-		Logger.debug('Add editor-UI session', { sessionId });
+		this.logger.debug('Add editor-UI session', { pushRef });
 
-		const existingConnection = connections[sessionId];
+		const existingConnection = connections[pushRef];
+
 		if (existingConnection) {
-			// Make sure to remove existing connection with the same id
+			// Make sure to remove existing connection with the same ID
 			this.close(existingConnection);
 		}
 
-		connections[sessionId] = connection;
+		connections[pushRef] = connection;
 	}
 
-	protected remove(sessionId?: string): void {
-		if (sessionId !== undefined) {
-			Logger.debug('Remove editor-UI session', { sessionId });
-			delete this.connections[sessionId];
+	protected remove(pushRef?: string) {
+		if (!pushRef) return;
+
+		this.logger.debug('Removed editor-UI session', { pushRef });
+
+		delete this.connections[pushRef];
+	}
+
+	private sendTo(type: IPushDataType, data: unknown, pushRefs: string[]) {
+		this.logger.debug(`Send data of type "${type}" to editor-UI`, {
+			dataType: type,
+			pushRefs: pushRefs.join(', '),
+		});
+
+		const stringifiedPayload = jsonStringify({ type, data }, { replaceCircularRefs: true });
+
+		for (const pushRef of pushRefs) {
+			const connection = this.connections[pushRef];
+			assert(connection);
+			this.sendToOneConnection(connection, stringifiedPayload);
 		}
 	}
 
-	send<D>(type: IPushDataType, data: D, sessionId: string | undefined) {
-		const { connections } = this;
-		if (sessionId !== undefined && connections[sessionId] === undefined) {
-			Logger.error(`The session "${sessionId}" is not registered.`, { sessionId });
+	sendToAll(type: IPushDataType, data?: unknown) {
+		this.sendTo(type, data, Object.keys(this.connections));
+	}
+
+	sendToOne(type: IPushDataType, data: unknown, pushRef: string) {
+		if (this.connections[pushRef] === undefined) {
+			this.logger.error(`The session "${pushRef}" is not registered.`, { pushRef });
 			return;
 		}
 
-		Logger.debug(`Send data of type "${type}" to editor-UI`, { dataType: type, sessionId });
+		this.sendTo(type, data, [pushRef]);
+	}
 
-		const sendData = jsonStringify({ type, data }, { replaceCircularRefs: true });
-
-		if (sessionId === undefined) {
-			// Send to all connected clients
-			Object.values(connections).forEach((connection) => this.sendToOne(connection, sendData));
-		} else {
-			// Send only to a specific client
-			this.sendToOne(connections[sessionId], sendData);
+	closeAllConnections() {
+		for (const pushRef in this.connections) {
+			// Signal the connection that we want to close it.
+			// We are not removing the sessions here because it should be
+			// the implementation's responsibility to do so once the connection
+			// has actually closed.
+			this.close(this.connections[pushRef]);
 		}
+	}
+
+	hasPushRef(pushRef: string) {
+		return this.connections[pushRef] !== undefined;
 	}
 }
