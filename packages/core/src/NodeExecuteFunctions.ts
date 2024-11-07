@@ -23,24 +23,22 @@ import type {
 } from 'axios';
 import axios from 'axios';
 import crypto, { createHmac } from 'crypto';
-import type { Request, Response } from 'express';
 import FileType from 'file-type';
 import FormData from 'form-data';
 import { createReadStream } from 'fs';
 import { access as fsAccess, writeFile as fsWriteFile } from 'fs/promises';
-import { IncomingMessage, type IncomingHttpHeaders } from 'http';
+import { IncomingMessage } from 'http';
 import { Agent, type AgentOptions } from 'https';
 import get from 'lodash/get';
 import isEmpty from 'lodash/isEmpty';
+import merge from 'lodash/merge';
 import pick from 'lodash/pick';
 import { DateTime } from 'luxon';
 import { extension, lookup } from 'mime-types';
 import type {
 	BinaryHelperFunctions,
 	CloseFunction,
-	ConnectionTypes,
 	ContextType,
-	EventNamesAiNodesType,
 	FieldType,
 	FileSystemHelperFunctions,
 	FunctionsBase,
@@ -61,7 +59,6 @@ import type {
 	IGetNodeParameterOptions,
 	IHookFunctions,
 	IHttpRequestOptions,
-	ILoadOptionsFunctions,
 	IN8nHttpFullResponse,
 	IN8nHttpResponse,
 	INode,
@@ -79,7 +76,6 @@ import type {
 	IPollFunctions,
 	IRequestOptions,
 	IRunExecutionData,
-	ISourceData,
 	ITaskData,
 	ITaskDataConnections,
 	ITriggerFunctions,
@@ -102,9 +98,19 @@ import type {
 	INodeParameters,
 	EnsureTypeOptions,
 	SSHTunnelFunctions,
-	SchedulingFunctions,
+	DeduplicationHelperFunctions,
+	IDeduplicationOutput,
+	IDeduplicationOutputItems,
+	ICheckProcessedOptions,
+	DeduplicationScope,
+	DeduplicationItemTypes,
+	ICheckProcessedContextData,
+	AiEvent,
+	ISupplyDataFunctions,
+	WebhookType,
 } from 'n8n-workflow';
 import {
+	NodeConnectionType,
 	ExpressionError,
 	LoggerProxy as Logger,
 	NodeApiError,
@@ -122,16 +128,19 @@ import {
 	jsonParse,
 	ApplicationError,
 	sleep,
-	OBFUSCATED_ERROR_MESSAGE,
 } from 'n8n-workflow';
 import type { Token } from 'oauth-1.0a';
 import clientOAuth1 from 'oauth-1.0a';
 import path from 'path';
 import { stringify } from 'qs';
 import { Readable } from 'stream';
+import Container from 'typedi';
 import url, { URL, URLSearchParams } from 'url';
 
+import { createAgentStartJob } from './Agent';
 import { BinaryDataService } from './BinaryData/BinaryData.service';
+import type { BinaryData } from './BinaryData/types';
+import { binaryToBuffer } from './BinaryData/utils';
 import {
 	BINARY_DATA_STORAGE_PATH,
 	BLOCK_FILE_ACCESS_TO_N8N_FILES,
@@ -144,22 +153,27 @@ import {
 	UM_EMAIL_TEMPLATES_INVITE,
 	UM_EMAIL_TEMPLATES_PWRESET,
 } from './Constants';
-import { extractValue } from './ExtractValue';
-import type { ExtendedValidationResult, IResponseError } from './Interfaces';
+import { createNodeAsTool } from './CreateNodeAsTool';
+import { DataDeduplicationService } from './data-deduplication-service';
 import {
 	getAllWorkflowExecutionMetadata,
 	getWorkflowExecutionMetadata,
 	setAllWorkflowExecutionMetadata,
 	setWorkflowExecutionMetadata,
 } from './ExecutionMetadata';
-import { getSecretsProxy } from './Secrets';
-import Container from 'typedi';
-import type { BinaryData } from './BinaryData/types';
-import merge from 'lodash/merge';
+import { extractValue } from './ExtractValue';
 import { InstanceSettings } from './InstanceSettings';
-import { ScheduledTaskManager } from './ScheduledTaskManager';
+import type { ExtendedValidationResult, IResponseError } from './Interfaces';
+// eslint-disable-next-line import/no-cycle
+import {
+	ExecuteSingleContext,
+	HookContext,
+	PollContext,
+	TriggerContext,
+	WebhookContext,
+} from './node-execution-context';
+import { getSecretsProxy } from './Secrets';
 import { SSHClientsManager } from './SSHClientsManager';
-import { binaryToBuffer } from './BinaryData/utils';
 
 axios.defaults.timeout = 300000;
 // Prevent axios from adding x-form-www-urlencoded headers by default
@@ -205,7 +219,7 @@ const createFormDataObject = (data: Record<string, unknown>) => {
 	return formData;
 };
 
-const validateUrl = (url?: string): boolean => {
+export const validateUrl = (url?: string): boolean => {
 	if (!url) return false;
 
 	try {
@@ -766,7 +780,7 @@ export function parseIncomingMessage(message: IncomingMessage) {
 	}
 }
 
-async function binaryToString(body: Buffer | Readable, encoding?: BufferEncoding) {
+export async function binaryToString(body: Buffer | Readable, encoding?: BufferEncoding) {
 	const buffer = await binaryToBuffer(body);
 	if (!encoding && body instanceof IncomingMessage) {
 		parseIncomingMessage(body);
@@ -1000,7 +1014,7 @@ export const removeEmptyBody = (requestOptions: IHttpRequestOptions | IRequestOp
 	}
 };
 
-async function httpRequest(
+export async function httpRequest(
 	requestOptions: IHttpRequestOptions,
 ): Promise<IN8nHttpFullResponse | IN8nHttpResponse> {
 	removeEmptyBody(requestOptions);
@@ -1195,7 +1209,7 @@ export async function copyBinaryFile(
  * base64 and adds metadata.
  */
 // eslint-disable-next-line complexity
-async function prepareBinaryData(
+export async function prepareBinaryData(
 	binaryData: Buffer | Readable,
 	executionId: string,
 	workflowId: string,
@@ -1283,7 +1297,75 @@ async function prepareBinaryData(
 	return await setBinaryDataBuffer(returnData, binaryData, workflowId, executionId);
 }
 
-function applyPaginationRequestData(
+export async function checkProcessedAndRecord(
+	items: DeduplicationItemTypes[],
+	scope: DeduplicationScope,
+	contextData: ICheckProcessedContextData,
+	options: ICheckProcessedOptions,
+): Promise<IDeduplicationOutput> {
+	return await DataDeduplicationService.getInstance().checkProcessedAndRecord(
+		items,
+		scope,
+		contextData,
+		options,
+	);
+}
+
+export async function checkProcessedItemsAndRecord(
+	key: string,
+	items: IDataObject[],
+	scope: DeduplicationScope,
+	contextData: ICheckProcessedContextData,
+	options: ICheckProcessedOptions,
+): Promise<IDeduplicationOutputItems> {
+	return await DataDeduplicationService.getInstance().checkProcessedItemsAndRecord(
+		key,
+		items,
+		scope,
+		contextData,
+		options,
+	);
+}
+
+export async function removeProcessed(
+	items: DeduplicationItemTypes[],
+	scope: DeduplicationScope,
+	contextData: ICheckProcessedContextData,
+	options: ICheckProcessedOptions,
+): Promise<void> {
+	return await DataDeduplicationService.getInstance().removeProcessed(
+		items,
+		scope,
+		contextData,
+		options,
+	);
+}
+
+export async function clearAllProcessedItems(
+	scope: DeduplicationScope,
+	contextData: ICheckProcessedContextData,
+	options: ICheckProcessedOptions,
+): Promise<void> {
+	return await DataDeduplicationService.getInstance().clearAllProcessedItems(
+		scope,
+		contextData,
+		options,
+	);
+}
+
+export async function getProcessedDataCount(
+	scope: DeduplicationScope,
+	contextData: ICheckProcessedContextData,
+	options: ICheckProcessedOptions,
+): Promise<number> {
+	return await DataDeduplicationService.getInstance().getProcessedDataCount(
+		scope,
+		contextData,
+		options,
+	);
+}
+
+export function applyPaginationRequestData(
 	requestData: IRequestOptions,
 	paginationRequestData: PaginationOptions['request'],
 ): IRequestOptions {
@@ -1342,7 +1424,9 @@ export async function requestOAuth2(
 	// if it's the first time using the credentials, get the access token and save it into the DB.
 	if (
 		credentials.grantType === 'clientCredentials' &&
-		(oauthTokenData === undefined || Object.keys(oauthTokenData).length === 0)
+		(oauthTokenData === undefined ||
+			Object.keys(oauthTokenData).length === 0 ||
+			oauthTokenData.access_token === '') // stub
 	) {
 		const { data } = await oAuthClient.credentials.getToken();
 		// Find the credentials
@@ -1654,7 +1738,8 @@ export async function httpRequestWithAuthentication(
 		if (additionalCredentialOptions?.credentialsDecrypted) {
 			credentialsDecrypted = additionalCredentialOptions.credentialsDecrypted.data;
 		} else {
-			credentialsDecrypted = await this.getCredentials(credentialsType);
+			credentialsDecrypted =
+				await this.getCredentials<ICredentialDataDecryptedObject>(credentialsType);
 		}
 
 		if (credentialsDecrypted === undefined) {
@@ -1851,7 +1936,10 @@ export async function requestWithAuthentication(
 		if (additionalCredentialOptions?.credentialsDecrypted) {
 			credentialsDecrypted = additionalCredentialOptions.credentialsDecrypted.data;
 		} else {
-			credentialsDecrypted = await this.getCredentials(credentialsType, itemIndex);
+			credentialsDecrypted = await this.getCredentials<ICredentialDataDecryptedObject>(
+				credentialsType,
+				itemIndex,
+			);
 		}
 
 		if (credentialsDecrypted === undefined) {
@@ -1948,7 +2036,7 @@ export function getAdditionalKeys(
 								if (mode === 'manual') {
 									throw e;
 								}
-								Logger.verbose(e.message);
+								Logger.debug(e.message);
 							}
 						},
 						setAll(obj: Record<string, string>): void {
@@ -1958,7 +2046,7 @@ export function getAdditionalKeys(
 								if (mode === 'manual') {
 									throw e;
 								}
-								Logger.verbose(e.message);
+								Logger.debug(e.message);
 							}
 						},
 						get(key: string): string {
@@ -1986,7 +2074,7 @@ export function getAdditionalKeys(
  * @param {INode} node Node which request the data
  * @param {string} type The credential type to return
  */
-export async function getCredentials(
+export async function getCredentials<T extends object = ICredentialDataDecryptedObject>(
 	workflow: Workflow,
 	node: INode,
 	type: string,
@@ -1997,7 +2085,7 @@ export async function getCredentials(
 	runIndex?: number,
 	connectionInputData?: INodeExecutionData[],
 	itemIndex?: number,
-): Promise<ICredentialDataDecryptedObject> {
+): Promise<T> {
 	// Get the NodeType as it has the information if the credentials are required
 	const nodeType = workflow.nodeTypes.getByNameAndVersion(node.type, node.typeVersion);
 	if (nodeType === undefined) {
@@ -2115,7 +2203,7 @@ export async function getCredentials(
 		expressionResolveValues,
 	);
 
-	return decryptedDataObject;
+	return decryptedDataObject as T;
 }
 
 /**
@@ -2546,7 +2634,7 @@ export function continueOnFail(node: INode): boolean {
  *
  */
 export function getNodeWebhookUrl(
-	name: string,
+	name: WebhookType,
 	workflow: Workflow,
 	node: INode,
 	additionalData: IWorkflowExecuteAdditionalData,
@@ -2591,7 +2679,7 @@ export function getNodeWebhookUrl(
  *
  */
 export function getWebhookDescription(
-	name: string,
+	name: WebhookType,
 	workflow: Workflow,
 	node: INode,
 ): IWebhookDescription | undefined {
@@ -2617,13 +2705,13 @@ const addExecutionDataFunctions = async (
 	nodeName: string,
 	data: INodeExecutionData[][] | ExecutionBaseError,
 	runExecutionData: IRunExecutionData,
-	connectionType: ConnectionTypes,
+	connectionType: NodeConnectionType,
 	additionalData: IWorkflowExecuteAdditionalData,
 	sourceNodeName: string,
 	sourceNodeRunIndex: number,
 	currentNodeRunIndex: number,
 ): Promise<void> => {
-	if (connectionType === 'main') {
+	if (connectionType === NodeConnectionType.Main) {
 		throw new ApplicationError('Setting type is not supported for main connection', {
 			extra: { type },
 		});
@@ -2716,18 +2804,20 @@ const addExecutionDataFunctions = async (
 	}
 };
 
-async function getInputConnectionData(
+export async function getInputConnectionData(
 	this: IAllExecuteFunctions,
 	workflow: Workflow,
 	runExecutionData: IRunExecutionData,
 	runIndex: number,
 	connectionInputData: INodeExecutionData[],
+	inputData: ITaskDataConnections,
 	additionalData: IWorkflowExecuteAdditionalData,
-	executeData: IExecuteData | undefined,
+	executeData: IExecuteData,
 	mode: WorkflowExecuteMode,
 	closeFunctions: CloseFunction[],
-	inputName: ConnectionTypes,
+	inputName: NodeConnectionType,
 	itemIndex: number,
+	abortSignal?: AbortSignal,
 ): Promise<unknown> {
 	const node = this.getNode();
 	const nodeType = workflow.nodeTypes.getByNameAndVersion(node.type, node.typeVersion);
@@ -2775,78 +2865,32 @@ async function getInputConnectionData(
 				connectedNode.typeVersion,
 			);
 
+			// eslint-disable-next-line @typescript-eslint/no-use-before-define
+			const context = getSupplyDataFunctions(
+				workflow,
+				runExecutionData,
+				runIndex,
+				connectionInputData,
+				inputData,
+				connectedNode,
+				additionalData,
+				executeData,
+				mode,
+				closeFunctions,
+				abortSignal,
+			);
+
 			if (!nodeType.supplyData) {
-				throw new ApplicationError('Node does not have a `supplyData` method defined', {
-					extra: { nodeName: connectedNode.name },
-				});
-			}
-
-			const context = Object.assign({}, this);
-
-			context.getNodeParameter = (
-				parameterName: string,
-				itemIndex: number,
-				fallbackValue?: any,
-				options?: IGetNodeParameterOptions,
-			) => {
-				return getNodeParameter(
-					workflow,
-					runExecutionData,
-					runIndex,
-					connectionInputData,
-					connectedNode,
-					parameterName,
-					itemIndex,
-					mode,
-					getAdditionalKeys(additionalData, mode, runExecutionData),
-					executeData,
-					fallbackValue,
-					{ ...(options || {}), contextNode: node },
-				) as any;
-			};
-
-			// TODO: Check what else should be overwritten
-			context.getNode = () => {
-				return deepCopy(connectedNode);
-			};
-
-			context.getCredentials = async (key: string) => {
-				try {
-					return await getCredentials(
-						workflow,
-						connectedNode,
-						key,
-						additionalData,
-						mode,
-						executeData,
-						runExecutionData,
-						runIndex,
-						connectionInputData,
-						itemIndex,
-					);
-				} catch (error) {
-					// Display the error on the node which is causing it
-
-					let currentNodeRunIndex = 0;
-					if (runExecutionData.resultData.runData.hasOwnProperty(node.name)) {
-						currentNodeRunIndex = runExecutionData.resultData.runData[node.name].length;
-					}
-
-					await addExecutionDataFunctions(
-						'input',
-						connectedNode.name,
-						error,
-						runExecutionData,
-						inputName,
-						additionalData,
-						node.name,
-						runIndex,
-						currentNodeRunIndex,
-					);
-
-					throw error;
+				if (nodeType.description.outputs.includes(NodeConnectionType.AiTool)) {
+					nodeType.supplyData = async function (this: IExecuteFunctions) {
+						return createNodeAsTool(this, nodeType, this.getNode().parameters);
+					};
+				} else {
+					throw new ApplicationError('Node does not have a `supplyData` method defined', {
+						extra: { nodeName: connectedNode.name },
+					});
 				}
-			};
+			}
 
 			try {
 				const response = await nodeType.supplyData.call(context, itemIndex);
@@ -2983,6 +3027,8 @@ const getRequestHelperFunctions = (
 	workflow: Workflow,
 	node: INode,
 	additionalData: IWorkflowExecuteAdditionalData,
+	runExecutionData: IRunExecutionData | null = null,
+	connectionInputData: INodeExecutionData[] = [],
 ): RequestHelperFunctions => {
 	const getResolvedValue = (
 		parameterValue: NodeParameterValueType,
@@ -2992,8 +3038,6 @@ const getRequestHelperFunctions = (
 		additionalKeys?: IWorkflowDataProxyAdditionalKeys,
 		returnObjectAsString = false,
 	): NodeParameterValueType => {
-		const runExecutionData: IRunExecutionData | null = null;
-		const connectionInputData: INodeExecutionData[] = [];
 		const mode: WorkflowExecuteMode = 'internal';
 
 		if (
@@ -3304,14 +3348,6 @@ const getSSHTunnelFunctions = (): SSHTunnelFunctions => ({
 		await Container.get(SSHClientsManager).getClient(credentials),
 });
 
-const getSchedulingFunctions = (workflow: Workflow): SchedulingFunctions => {
-	const scheduledTaskManager = Container.get(ScheduledTaskManager);
-	return {
-		registerCron: (cronExpression, onTick) =>
-			scheduledTaskManager.registerCron(workflow, cronExpression, onTick),
-	};
-};
-
 const getAllowedPaths = () => {
 	const restrictFileAccessTo = process.env[RESTRICT_FILE_ACCESS_TO];
 	if (!restrictFileAccessTo) {
@@ -3324,7 +3360,7 @@ const getAllowedPaths = () => {
 	return allowedPaths;
 };
 
-function isFilePathBlocked(filePath: string): boolean {
+export function isFilePathBlocked(filePath: string): boolean {
 	const allowedPaths = getAllowedPaths();
 	const resolvedFilePath = path.resolve(filePath);
 	const blockFileAccessToN8nFiles = process.env[BLOCK_FILE_ACCESS_TO_N8N_FILES] !== 'false';
@@ -3340,10 +3376,10 @@ function isFilePathBlocked(filePath: string): boolean {
 		return true;
 	}
 
-	//restrict access to .n8n folder and other .env config related paths
+	//restrict access to .n8n folder, ~/.cache/n8n/public, and other .env config related paths
 	if (blockFileAccessToN8nFiles) {
-		const { n8nFolder } = Container.get(InstanceSettings);
-		const restrictedPaths = [n8nFolder];
+		const { n8nFolder, staticCacheDir } = Container.get(InstanceSettings);
+		const restrictedPaths = [n8nFolder, staticCacheDir];
 
 		if (process.env[CONFIG_FILES]) {
 			restrictedPaths.push(...process.env[CONFIG_FILES].split(','));
@@ -3440,6 +3476,52 @@ const getBinaryHelperFunctions = (
 	},
 });
 
+const getCheckProcessedHelperFunctions = (
+	workflow: Workflow,
+	node: INode,
+): DeduplicationHelperFunctions => ({
+	async checkProcessedAndRecord(
+		items: DeduplicationItemTypes[],
+		scope: DeduplicationScope,
+		options: ICheckProcessedOptions,
+	): Promise<IDeduplicationOutput> {
+		return await checkProcessedAndRecord(items, scope, { node, workflow }, options);
+	},
+	async checkProcessedItemsAndRecord(
+		propertyName: string,
+		items: IDataObject[],
+		scope: DeduplicationScope,
+		options: ICheckProcessedOptions,
+	): Promise<IDeduplicationOutputItems> {
+		return await checkProcessedItemsAndRecord(
+			propertyName,
+			items,
+			scope,
+			{ node, workflow },
+			options,
+		);
+	},
+	async removeProcessed(
+		items: DeduplicationItemTypes[],
+		scope: DeduplicationScope,
+		options: ICheckProcessedOptions,
+	): Promise<void> {
+		return await removeProcessed(items, scope, { node, workflow }, options);
+	},
+	async clearAllProcessedItems(
+		scope: DeduplicationScope,
+		options: ICheckProcessedOptions,
+	): Promise<void> {
+		return await clearAllProcessedItems(scope, { node, workflow }, options);
+	},
+	async getProcessedDataCount(
+		scope: DeduplicationScope,
+		options: ICheckProcessedOptions,
+	): Promise<number> {
+		return await getProcessedDataCount(scope, { node, workflow }, options);
+	},
+});
+
 /**
  * Returns a copy of the items which only contains the json data and
  * of that only the defined properties
@@ -3469,57 +3551,7 @@ export function getExecutePollFunctions(
 	mode: WorkflowExecuteMode,
 	activation: WorkflowActivateMode,
 ): IPollFunctions {
-	return ((workflow: Workflow, node: INode) => {
-		return {
-			...getCommonWorkflowFunctions(workflow, node, additionalData),
-			__emit: (): void => {
-				throw new ApplicationError(
-					'Overwrite NodeExecuteFunctions.getExecutePollFunctions.__emit function',
-				);
-			},
-			__emitError() {
-				throw new ApplicationError(
-					'Overwrite NodeExecuteFunctions.getExecutePollFunctions.__emitError function',
-				);
-			},
-			getMode: () => mode,
-			getActivationMode: () => activation,
-			getCredentials: async (type) =>
-				await getCredentials(workflow, node, type, additionalData, mode),
-			getNodeParameter: (
-				parameterName: string,
-				fallbackValue?: any,
-				options?: IGetNodeParameterOptions,
-			): NodeParameterValueType | object => {
-				const runExecutionData: IRunExecutionData | null = null;
-				const itemIndex = 0;
-				const runIndex = 0;
-				const connectionInputData: INodeExecutionData[] = [];
-
-				return getNodeParameter(
-					workflow,
-					runExecutionData,
-					runIndex,
-					connectionInputData,
-					node,
-					parameterName,
-					itemIndex,
-					mode,
-					getAdditionalKeys(additionalData, mode, runExecutionData),
-					undefined,
-					fallbackValue,
-					options,
-				);
-			},
-			helpers: {
-				createDeferredPromise,
-				...getRequestHelperFunctions(workflow, node, additionalData),
-				...getBinaryHelperFunctions(additionalData, workflow.id),
-				...getSchedulingFunctions(workflow),
-				returnJsonArray,
-			},
-		};
-	})(workflow, node);
+	return new PollContext(workflow, node, additionalData, mode, activation);
 }
 
 /**
@@ -3533,58 +3565,7 @@ export function getExecuteTriggerFunctions(
 	mode: WorkflowExecuteMode,
 	activation: WorkflowActivateMode,
 ): ITriggerFunctions {
-	return ((workflow: Workflow, node: INode) => {
-		return {
-			...getCommonWorkflowFunctions(workflow, node, additionalData),
-			emit: (): void => {
-				throw new ApplicationError(
-					'Overwrite NodeExecuteFunctions.getExecuteTriggerFunctions.emit function',
-				);
-			},
-			emitError: (): void => {
-				throw new ApplicationError(
-					'Overwrite NodeExecuteFunctions.getExecuteTriggerFunctions.emit function',
-				);
-			},
-			getMode: () => mode,
-			getActivationMode: () => activation,
-			getCredentials: async (type) =>
-				await getCredentials(workflow, node, type, additionalData, mode),
-			getNodeParameter: (
-				parameterName: string,
-				fallbackValue?: any,
-				options?: IGetNodeParameterOptions,
-			): NodeParameterValueType | object => {
-				const runExecutionData: IRunExecutionData | null = null;
-				const itemIndex = 0;
-				const runIndex = 0;
-				const connectionInputData: INodeExecutionData[] = [];
-
-				return getNodeParameter(
-					workflow,
-					runExecutionData,
-					runIndex,
-					connectionInputData,
-					node,
-					parameterName,
-					itemIndex,
-					mode,
-					getAdditionalKeys(additionalData, mode, runExecutionData),
-					undefined,
-					fallbackValue,
-					options,
-				);
-			},
-			helpers: {
-				createDeferredPromise,
-				...getSSHTunnelFunctions(),
-				...getRequestHelperFunctions(workflow, node, additionalData),
-				...getBinaryHelperFunctions(additionalData, workflow.id),
-				...getSchedulingFunctions(workflow),
-				returnJsonArray,
-			},
-		};
-	})(workflow, node);
+	return new TriggerContext(workflow, node, additionalData, mode, activation);
 }
 
 /**
@@ -3622,14 +3603,10 @@ export function getExecuteFunctions(
 					itemIndex,
 				),
 			getExecuteData: () => executeData,
-			continueOnFail: (error?: Error) => {
-				const shouldContinue = continueOnFail(node);
-				if (error && shouldContinue && !(error instanceof ApplicationError)) {
-					error.message = OBFUSCATED_ERROR_MESSAGE;
-				}
-				return shouldContinue;
+			continueOnFail: () => {
+				return continueOnFail(node);
 			},
-			evaluateExpression: (expression: string, itemIndex: number) => {
+			evaluateExpression(expression: string, itemIndex: number) {
 				return workflow.expression.resolveSimpleParameterValue(
 					`=${expression}`,
 					{},
@@ -3670,7 +3647,7 @@ export function getExecuteFunctions(
 			},
 
 			async getInputConnectionData(
-				inputName: ConnectionTypes,
+				inputName: NodeConnectionType,
 				itemIndex: number,
 			): Promise<unknown> {
 				return await getInputConnectionData.call(
@@ -3679,12 +3656,14 @@ export function getExecuteFunctions(
 					runExecutionData,
 					runIndex,
 					connectionInputData,
+					inputData,
 					additionalData,
 					executeData,
 					mode,
 					closeFunctions,
 					inputName,
 					itemIndex,
+					abortSignal,
 				);
 			},
 
@@ -3780,6 +3759,17 @@ export function getExecuteFunctions(
 					additionalData.setExecutionStatus('waiting');
 				}
 			},
+			logNodeOutput(...args: unknown[]): void {
+				if (mode === 'manual') {
+					// @ts-expect-error `args` is spreadable
+					this.sendMessageToUI(...args);
+					return;
+				}
+
+				if (process.env.CODE_ENABLE_STDOUT === 'true') {
+					console.log(`[Workflow "${this.getWorkflow().id}"][Node "${node.name}"]`, ...args);
+				}
+			},
 			sendMessageToUI(...args: any[]): void {
 				if (mode !== 'manual') {
 					return;
@@ -3811,7 +3801,7 @@ export function getExecuteFunctions(
 			},
 
 			addInputData(
-				connectionType: ConnectionTypes,
+				connectionType: NodeConnectionType,
 				data: INodeExecutionData[][] | ExecutionBaseError,
 			): { index: number } {
 				const nodeName = this.getNode().name;
@@ -3841,7 +3831,7 @@ export function getExecuteFunctions(
 				return { index: currentNodeRunIndex };
 			},
 			addOutputData(
-				connectionType: ConnectionTypes,
+				connectionType: NodeConnectionType,
 				currentNodeRunIndex: number,
 				data: INodeExecutionData[][] | ExecutionBaseError,
 			): void {
@@ -3866,10 +3856,17 @@ export function getExecuteFunctions(
 			helpers: {
 				createDeferredPromise,
 				copyInputItems,
-				...getRequestHelperFunctions(workflow, node, additionalData),
+				...getRequestHelperFunctions(
+					workflow,
+					node,
+					additionalData,
+					runExecutionData,
+					connectionInputData,
+				),
 				...getSSHTunnelFunctions(),
 				...getFileSystemHelperFunctions(node),
 				...getBinaryHelperFunctions(additionalData, workflow.id),
+				...getCheckProcessedHelperFunctions(workflow, node),
 				assertBinaryData: (itemIndex, propertyName) =>
 					assertBinaryData(inputData, node, itemIndex, propertyName, 0),
 				getBinaryDataBuffer: async (itemIndex, propertyName) =>
@@ -3880,8 +3877,8 @@ export function getExecuteFunctions(
 				constructExecutionMetaData,
 			},
 			nodeHelpers: getNodeHelperFunctions(additionalData, workflow.id),
-			logAiEvent: async (eventName: EventNamesAiNodesType, msg: string) => {
-				return await additionalData.logAiEvent(eventName, {
+			logAiEvent: (eventName: AiEvent, msg: string) => {
+				return additionalData.logAiEvent(eventName, {
 					executionId: additionalData.executionId ?? 'unsaved-execution',
 					nodeName: node.name,
 					workflowName: workflow.name ?? 'Unnamed workflow',
@@ -3891,8 +3888,285 @@ export function getExecuteFunctions(
 				});
 			},
 			getParentCallbackManager: () => additionalData.parentCallbackManager,
+			startJob: createAgentStartJob(
+				additionalData,
+				inputData,
+				node,
+				workflow,
+				runExecutionData,
+				runIndex,
+				node.name,
+				connectionInputData,
+				{},
+				mode,
+				executeData,
+			),
 		};
 	})(workflow, runExecutionData, connectionInputData, inputData, node) as IExecuteFunctions;
+}
+
+export function getSupplyDataFunctions(
+	workflow: Workflow,
+	runExecutionData: IRunExecutionData,
+	runIndex: number,
+	connectionInputData: INodeExecutionData[],
+	inputData: ITaskDataConnections,
+	node: INode,
+	additionalData: IWorkflowExecuteAdditionalData,
+	executeData: IExecuteData,
+	mode: WorkflowExecuteMode,
+	closeFunctions: CloseFunction[],
+	abortSignal?: AbortSignal,
+): ISupplyDataFunctions {
+	return {
+		...getCommonWorkflowFunctions(workflow, node, additionalData),
+		...executionCancellationFunctions(abortSignal),
+		getMode: () => mode,
+		getCredentials: async (type, itemIndex) =>
+			await getCredentials(
+				workflow,
+				node,
+				type,
+				additionalData,
+				mode,
+				executeData,
+				runExecutionData,
+				runIndex,
+				connectionInputData,
+				itemIndex,
+			),
+		continueOnFail: () => continueOnFail(node),
+		evaluateExpression: (expression: string, itemIndex: number) =>
+			workflow.expression.resolveSimpleParameterValue(
+				`=${expression}`,
+				{},
+				runExecutionData,
+				runIndex,
+				itemIndex,
+				node.name,
+				connectionInputData,
+				mode,
+				getAdditionalKeys(additionalData, mode, runExecutionData),
+				executeData,
+			),
+		executeWorkflow: async (
+			workflowInfo: IExecuteWorkflowInfo,
+			inputData?: INodeExecutionData[],
+			parentCallbackManager?: CallbackManager,
+		) =>
+			await additionalData
+				.executeWorkflow(workflowInfo, additionalData, {
+					parentWorkflowId: workflow.id?.toString(),
+					inputData,
+					parentWorkflowSettings: workflow.settings,
+					node,
+					parentCallbackManager,
+				})
+				.then(
+					async (result) =>
+						await Container.get(BinaryDataService).duplicateBinaryData(
+							workflow.id,
+							additionalData.executionId!,
+							result,
+						),
+				),
+		getNodeOutputs() {
+			const nodeType = workflow.nodeTypes.getByNameAndVersion(node.type, node.typeVersion);
+			return NodeHelpers.getNodeOutputs(workflow, node, nodeType.description).map((output) => {
+				if (typeof output === 'string') {
+					return {
+						type: output,
+					};
+				}
+				return output;
+			});
+		},
+		async getInputConnectionData(
+			inputName: NodeConnectionType,
+			itemIndex: number,
+		): Promise<unknown> {
+			return await getInputConnectionData.call(
+				this,
+				workflow,
+				runExecutionData,
+				runIndex,
+				connectionInputData,
+				inputData,
+				additionalData,
+				executeData,
+				mode,
+				closeFunctions,
+				inputName,
+				itemIndex,
+				abortSignal,
+			);
+		},
+		getInputData: (inputIndex = 0, inputName = 'main') => {
+			if (!inputData.hasOwnProperty(inputName)) {
+				// Return empty array because else it would throw error when nothing is connected to input
+				return [];
+			}
+
+			// TODO: Check if nodeType has input with that index defined
+			if (inputData[inputName].length < inputIndex) {
+				throw new ApplicationError('Could not get input with given index', {
+					extra: { inputIndex, inputName },
+				});
+			}
+
+			if (inputData[inputName][inputIndex] === null) {
+				throw new ApplicationError('Value of input was not set', {
+					extra: { inputIndex, inputName },
+				});
+			}
+
+			return inputData[inputName][inputIndex];
+		},
+		getNodeParameter: ((
+			parameterName: string,
+			itemIndex: number,
+			fallbackValue?: any,
+			options?: IGetNodeParameterOptions,
+		) =>
+			getNodeParameter(
+				workflow,
+				runExecutionData,
+				runIndex,
+				connectionInputData,
+				node,
+				parameterName,
+				itemIndex,
+				mode,
+				getAdditionalKeys(additionalData, mode, runExecutionData),
+				executeData,
+				fallbackValue,
+				options,
+			)) as ISupplyDataFunctions['getNodeParameter'],
+		getWorkflowDataProxy: (itemIndex: number) =>
+			new WorkflowDataProxy(
+				workflow,
+				runExecutionData,
+				runIndex,
+				itemIndex,
+				node.name,
+				connectionInputData,
+				{},
+				mode,
+				getAdditionalKeys(additionalData, mode, runExecutionData),
+				executeData,
+			).getDataProxy(),
+		sendMessageToUI(...args: any[]): void {
+			if (mode !== 'manual') {
+				return;
+			}
+			try {
+				if (additionalData.sendDataToUI) {
+					args = args.map((arg) => {
+						// prevent invalid dates from being logged as null
+						if (arg.isLuxonDateTime && arg.invalidReason) return { ...arg };
+
+						// log valid dates in human readable format, as in browser
+						if (arg.isLuxonDateTime) return new Date(arg.ts).toString();
+						if (arg instanceof Date) return arg.toString();
+
+						return arg;
+					});
+
+					additionalData.sendDataToUI('sendConsoleMessage', {
+						source: `[Node: "${node.name}"]`,
+						messages: args,
+					});
+				}
+			} catch (error) {
+				Logger.warn(`There was a problem sending message to UI: ${error.message}`);
+			}
+		},
+		logAiEvent: (eventName: AiEvent, msg: string) =>
+			additionalData.logAiEvent(eventName, {
+				executionId: additionalData.executionId ?? 'unsaved-execution',
+				nodeName: node.name,
+				workflowName: workflow.name ?? 'Unnamed workflow',
+				nodeType: node.type,
+				workflowId: workflow.id ?? 'unsaved-workflow',
+				msg,
+			}),
+		addInputData(
+			connectionType: NodeConnectionType,
+			data: INodeExecutionData[][],
+		): { index: number } {
+			const nodeName = this.getNode().name;
+			let currentNodeRunIndex = 0;
+			if (runExecutionData.resultData.runData.hasOwnProperty(nodeName)) {
+				currentNodeRunIndex = runExecutionData.resultData.runData[nodeName].length;
+			}
+
+			addExecutionDataFunctions(
+				'input',
+				this.getNode().name,
+				data,
+				runExecutionData,
+				connectionType,
+				additionalData,
+				node.name,
+				runIndex,
+				currentNodeRunIndex,
+			).catch((error) => {
+				Logger.warn(
+					`There was a problem logging input data of node "${this.getNode().name}": ${
+						error.message
+					}`,
+				);
+			});
+
+			return { index: currentNodeRunIndex };
+		},
+		addOutputData(
+			connectionType: NodeConnectionType,
+			currentNodeRunIndex: number,
+			data: INodeExecutionData[][],
+		): void {
+			addExecutionDataFunctions(
+				'output',
+				this.getNode().name,
+				data,
+				runExecutionData,
+				connectionType,
+				additionalData,
+				node.name,
+				runIndex,
+				currentNodeRunIndex,
+			).catch((error) => {
+				Logger.warn(
+					`There was a problem logging output data of node "${this.getNode().name}": ${
+						error.message
+					}`,
+				);
+			});
+		},
+		helpers: {
+			createDeferredPromise,
+			copyInputItems,
+			...getRequestHelperFunctions(
+				workflow,
+				node,
+				additionalData,
+				runExecutionData,
+				connectionInputData,
+			),
+			...getSSHTunnelFunctions(),
+			...getFileSystemHelperFunctions(node),
+			...getBinaryHelperFunctions(additionalData, workflow.id),
+			...getCheckProcessedHelperFunctions(workflow, node),
+			assertBinaryData: (itemIndex, propertyName) =>
+				assertBinaryData(inputData, node, itemIndex, propertyName, 0),
+			getBinaryDataBuffer: async (itemIndex, propertyName) =>
+				await getBinaryDataBuffer(inputData, itemIndex, propertyName, 0),
+
+			returnJsonArray,
+			normalizeItems,
+			constructExecutionMetaData,
+		},
+	};
 }
 
 /**
@@ -3911,138 +4185,19 @@ export function getExecuteSingleFunctions(
 	mode: WorkflowExecuteMode,
 	abortSignal?: AbortSignal,
 ): IExecuteSingleFunctions {
-	return ((workflow, runExecutionData, connectionInputData, inputData, node, itemIndex) => {
-		return {
-			...getCommonWorkflowFunctions(workflow, node, additionalData),
-			...executionCancellationFunctions(abortSignal),
-			continueOnFail: () => continueOnFail(node),
-			evaluateExpression: (expression: string, evaluateItemIndex: number | undefined) => {
-				evaluateItemIndex = evaluateItemIndex === undefined ? itemIndex : evaluateItemIndex;
-				return workflow.expression.resolveSimpleParameterValue(
-					`=${expression}`,
-					{},
-					runExecutionData,
-					runIndex,
-					evaluateItemIndex,
-					node.name,
-					connectionInputData,
-					mode,
-					getAdditionalKeys(additionalData, mode, runExecutionData),
-					executeData,
-				);
-			},
-			getContext(type: ContextType): IContextObject {
-				return NodeHelpers.getContext(runExecutionData, type, node);
-			},
-			getCredentials: async (type) =>
-				await getCredentials(
-					workflow,
-					node,
-					type,
-					additionalData,
-					mode,
-					executeData,
-					runExecutionData,
-					runIndex,
-					connectionInputData,
-					itemIndex,
-				),
-			getInputData: (inputIndex = 0, inputName = 'main') => {
-				if (!inputData.hasOwnProperty(inputName)) {
-					// Return empty array because else it would throw error when nothing is connected to input
-					return { json: {} };
-				}
-
-				// TODO: Check if nodeType has input with that index defined
-				if (inputData[inputName].length < inputIndex) {
-					throw new ApplicationError('Could not get input index', {
-						extra: { inputIndex, inputName },
-					});
-				}
-
-				const allItems = inputData[inputName][inputIndex];
-
-				if (allItems === null) {
-					throw new ApplicationError('Input index was not set', {
-						extra: { inputIndex, inputName },
-					});
-				}
-
-				if (allItems[itemIndex] === null) {
-					throw new ApplicationError('Value of input with given index was not set', {
-						extra: { inputIndex, inputName, itemIndex },
-					});
-				}
-
-				return allItems[itemIndex];
-			},
-			getInputSourceData: (inputIndex = 0, inputName = 'main') => {
-				if (executeData?.source === null) {
-					// Should never happen as n8n sets it automatically
-					throw new ApplicationError('Source data is missing');
-				}
-				return executeData.source[inputName][inputIndex] as ISourceData;
-			},
-			getItemIndex: () => itemIndex,
-			getMode: () => mode,
-			getExecuteData: () => executeData,
-			getNodeParameter: (
-				parameterName: string,
-				fallbackValue?: any,
-				options?: IGetNodeParameterOptions,
-			): NodeParameterValueType | object => {
-				return getNodeParameter(
-					workflow,
-					runExecutionData,
-					runIndex,
-					connectionInputData,
-					node,
-					parameterName,
-					itemIndex,
-					mode,
-					getAdditionalKeys(additionalData, mode, runExecutionData),
-					executeData,
-					fallbackValue,
-					options,
-				);
-			},
-			getWorkflowDataProxy: (): IWorkflowDataProxyData => {
-				const dataProxy = new WorkflowDataProxy(
-					workflow,
-					runExecutionData,
-					runIndex,
-					itemIndex,
-					node.name,
-					connectionInputData,
-					{},
-					mode,
-					getAdditionalKeys(additionalData, mode, runExecutionData),
-					executeData,
-				);
-				return dataProxy.getDataProxy();
-			},
-			helpers: {
-				createDeferredPromise,
-				...getRequestHelperFunctions(workflow, node, additionalData),
-				...getBinaryHelperFunctions(additionalData, workflow.id),
-
-				assertBinaryData: (propertyName, inputIndex = 0) =>
-					assertBinaryData(inputData, node, itemIndex, propertyName, inputIndex),
-				getBinaryDataBuffer: async (propertyName, inputIndex = 0) =>
-					await getBinaryDataBuffer(inputData, itemIndex, propertyName, inputIndex),
-			},
-			logAiEvent: async (eventName: EventNamesAiNodesType, msg: string) => {
-				return await additionalData.logAiEvent(eventName, {
-					executionId: additionalData.executionId ?? 'unsaved-execution',
-					nodeName: node.name,
-					workflowName: workflow.name ?? 'Unnamed workflow',
-					nodeType: node.type,
-					workflowId: workflow.id ?? 'unsaved-workflow',
-					msg,
-				});
-			},
-		};
-	})(workflow, runExecutionData, connectionInputData, inputData, node, itemIndex);
+	return new ExecuteSingleContext(
+		workflow,
+		node,
+		additionalData,
+		mode,
+		runExecutionData,
+		runIndex,
+		connectionInputData,
+		inputData,
+		itemIndex,
+		executeData,
+		abortSignal,
+	);
 }
 
 export function getCredentialTestFunctions(): ICredentialTestFunctions {
@@ -4057,85 +4212,6 @@ export function getCredentialTestFunctions(): ICredentialTestFunctions {
 }
 
 /**
- * Returns the execute functions regular nodes have access to in load-options-function.
- */
-export function getLoadOptionsFunctions(
-	workflow: Workflow,
-	node: INode,
-	path: string,
-	additionalData: IWorkflowExecuteAdditionalData,
-): ILoadOptionsFunctions {
-	return ((workflow: Workflow, node: INode, path: string) => {
-		return {
-			...getCommonWorkflowFunctions(workflow, node, additionalData),
-			getCredentials: async (type) =>
-				await getCredentials(workflow, node, type, additionalData, 'internal'),
-			getCurrentNodeParameter: (
-				parameterPath: string,
-				options?: IGetNodeParameterOptions,
-			): NodeParameterValueType | object | undefined => {
-				const nodeParameters = additionalData.currentNodeParameters;
-
-				if (parameterPath.charAt(0) === '&') {
-					parameterPath = `${path.split('.').slice(1, -1).join('.')}.${parameterPath.slice(1)}`;
-				}
-
-				let returnData = get(nodeParameters, parameterPath);
-
-				// This is outside the try/catch because it throws errors with proper messages
-				if (options?.extractValue) {
-					const nodeType = workflow.nodeTypes.getByNameAndVersion(node.type, node.typeVersion);
-					if (nodeType === undefined) {
-						throw new ApplicationError('Node type is not known so cannot return parameter value', {
-							tags: { nodeType: node.type },
-						});
-					}
-					returnData = extractValue(
-						returnData,
-						parameterPath,
-						node,
-						nodeType,
-					) as NodeParameterValueType;
-				}
-
-				return returnData;
-			},
-			getCurrentNodeParameters: () => additionalData.currentNodeParameters,
-			getNodeParameter: (
-				parameterName: string,
-				fallbackValue?: any,
-				options?: IGetNodeParameterOptions,
-			): NodeParameterValueType | object => {
-				const runExecutionData: IRunExecutionData | null = null;
-				const itemIndex = 0;
-				const runIndex = 0;
-				const mode = 'internal' as WorkflowExecuteMode;
-				const connectionInputData: INodeExecutionData[] = [];
-
-				return getNodeParameter(
-					workflow,
-					runExecutionData,
-					runIndex,
-					connectionInputData,
-					node,
-					parameterName,
-					itemIndex,
-					mode,
-					getAdditionalKeys(additionalData, mode, runExecutionData),
-					undefined,
-					fallbackValue,
-					options,
-				);
-			},
-			helpers: {
-				...getSSHTunnelFunctions(),
-				...getRequestHelperFunctions(workflow, node, additionalData),
-			},
-		};
-	})(workflow, node, path);
-}
-
-/**
  * Returns the execute functions regular nodes have access to in hook-function.
  */
 export function getExecuteHookFunctions(
@@ -4146,59 +4222,7 @@ export function getExecuteHookFunctions(
 	activation: WorkflowActivateMode,
 	webhookData?: IWebhookData,
 ): IHookFunctions {
-	return ((workflow: Workflow, node: INode) => {
-		return {
-			...getCommonWorkflowFunctions(workflow, node, additionalData),
-			getCredentials: async (type) =>
-				await getCredentials(workflow, node, type, additionalData, mode),
-			getMode: () => mode,
-			getActivationMode: () => activation,
-			getNodeParameter: (
-				parameterName: string,
-				fallbackValue?: any,
-				options?: IGetNodeParameterOptions,
-			): NodeParameterValueType | object => {
-				const runExecutionData: IRunExecutionData | null = null;
-				const itemIndex = 0;
-				const runIndex = 0;
-				const connectionInputData: INodeExecutionData[] = [];
-
-				return getNodeParameter(
-					workflow,
-					runExecutionData,
-					runIndex,
-					connectionInputData,
-					node,
-					parameterName,
-					itemIndex,
-					mode,
-					getAdditionalKeys(additionalData, mode, runExecutionData),
-					undefined,
-					fallbackValue,
-					options,
-				);
-			},
-			getNodeWebhookUrl: (name: string): string | undefined => {
-				return getNodeWebhookUrl(
-					name,
-					workflow,
-					node,
-					additionalData,
-					mode,
-					getAdditionalKeys(additionalData, mode, null),
-					webhookData?.isTest,
-				);
-			},
-			getWebhookName(): string {
-				if (webhookData === undefined) {
-					throw new ApplicationError('Only supported in webhook functions');
-				}
-				return webhookData.webhookDescription.name;
-			},
-			getWebhookDescription: (name) => getWebhookDescription(name, workflow, node),
-			helpers: getRequestHelperFunctions(workflow, node, additionalData),
-		};
-	})(workflow, node);
+	return new HookContext(workflow, node, additionalData, mode, activation, webhookData);
 }
 
 /**
@@ -4212,129 +4236,15 @@ export function getExecuteWebhookFunctions(
 	mode: WorkflowExecuteMode,
 	webhookData: IWebhookData,
 	closeFunctions: CloseFunction[],
+	runExecutionData: IRunExecutionData | null,
 ): IWebhookFunctions {
-	return ((workflow: Workflow, node: INode) => {
-		return {
-			...getCommonWorkflowFunctions(workflow, node, additionalData),
-			getBodyData(): IDataObject {
-				if (additionalData.httpRequest === undefined) {
-					throw new ApplicationError('Request is missing');
-				}
-				return additionalData.httpRequest.body;
-			},
-			getCredentials: async (type) =>
-				await getCredentials(workflow, node, type, additionalData, mode),
-			getHeaderData(): IncomingHttpHeaders {
-				if (additionalData.httpRequest === undefined) {
-					throw new ApplicationError('Request is missing');
-				}
-				return additionalData.httpRequest.headers;
-			},
-			async getInputConnectionData(
-				inputName: ConnectionTypes,
-				itemIndex: number,
-			): Promise<unknown> {
-				// To be able to use expressions like "$json.sessionId" set the
-				// body data the webhook received to what is normally used for
-				// incoming node data.
-				const connectionInputData: INodeExecutionData[] = [
-					{ json: additionalData.httpRequest?.body || {} },
-				];
-				const runExecutionData: IRunExecutionData = {
-					resultData: {
-						runData: {},
-					},
-				};
-				const executeData: IExecuteData = {
-					data: {
-						main: [connectionInputData],
-					},
-					node,
-					source: null,
-				};
-				const runIndex = 0;
-
-				return await getInputConnectionData.call(
-					this,
-					workflow,
-					runExecutionData,
-					runIndex,
-					connectionInputData,
-					additionalData,
-					executeData,
-					mode,
-					closeFunctions,
-					inputName,
-					itemIndex,
-				);
-			},
-			getMode: () => mode,
-			getNodeParameter: (
-				parameterName: string,
-				fallbackValue?: any,
-				options?: IGetNodeParameterOptions,
-			): NodeParameterValueType | object => {
-				const runExecutionData: IRunExecutionData | null = null;
-				const itemIndex = 0;
-				const runIndex = 0;
-				const connectionInputData: INodeExecutionData[] = [];
-
-				return getNodeParameter(
-					workflow,
-					runExecutionData,
-					runIndex,
-					connectionInputData,
-					node,
-					parameterName,
-					itemIndex,
-					mode,
-					getAdditionalKeys(additionalData, mode, null),
-					undefined,
-					fallbackValue,
-					options,
-				);
-			},
-			getParamsData(): object {
-				if (additionalData.httpRequest === undefined) {
-					throw new ApplicationError('Request is missing');
-				}
-				return additionalData.httpRequest.params;
-			},
-			getQueryData(): object {
-				if (additionalData.httpRequest === undefined) {
-					throw new ApplicationError('Request is missing');
-				}
-				return additionalData.httpRequest.query;
-			},
-			getRequestObject(): Request {
-				if (additionalData.httpRequest === undefined) {
-					throw new ApplicationError('Request is missing');
-				}
-				return additionalData.httpRequest;
-			},
-			getResponseObject(): Response {
-				if (additionalData.httpResponse === undefined) {
-					throw new ApplicationError('Response is missing');
-				}
-				return additionalData.httpResponse;
-			},
-			getNodeWebhookUrl: (name: string): string | undefined =>
-				getNodeWebhookUrl(
-					name,
-					workflow,
-					node,
-					additionalData,
-					mode,
-					getAdditionalKeys(additionalData, mode, null),
-				),
-			getWebhookName: () => webhookData.webhookDescription.name,
-			helpers: {
-				createDeferredPromise,
-				...getRequestHelperFunctions(workflow, node, additionalData),
-				...getBinaryHelperFunctions(additionalData, workflow.id),
-				returnJsonArray,
-			},
-			nodeHelpers: getNodeHelperFunctions(additionalData, workflow.id),
-		};
-	})(workflow, node);
+	return new WebhookContext(
+		workflow,
+		node,
+		additionalData,
+		mode,
+		webhookData,
+		closeFunctions,
+		runExecutionData,
+	);
 }

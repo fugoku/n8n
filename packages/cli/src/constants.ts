@@ -1,7 +1,7 @@
 import { readFileSync } from 'fs';
-import { resolve, join, dirname } from 'path';
 import type { n8n } from 'n8n-core';
 import { jsonParse } from 'n8n-workflow';
+import { resolve, join, dirname } from 'path';
 
 const { NODE_ENV, E2E_TESTS } = process.env;
 export const inProduction = NODE_ENV === 'production';
@@ -90,6 +90,9 @@ export const LICENSE_FEATURES = {
 	PROJECT_ROLE_ADMIN: 'feat:projectRole:admin',
 	PROJECT_ROLE_EDITOR: 'feat:projectRole:editor',
 	PROJECT_ROLE_VIEWER: 'feat:projectRole:viewer',
+	AI_ASSISTANT: 'feat:aiAssistant',
+	ASK_AI: 'feat:askAi',
+	COMMUNITY_NODES_CUSTOM_REGISTRY: 'feat:communityNodes:customRegistry',
 } as const;
 
 export const LICENSE_QUOTAS = {
@@ -124,6 +127,9 @@ export const TIME = {
  * Eventually this will superseed `TIME` above
  */
 export const Time = {
+	milliseconds: {
+		toMinutes: 1 / (60 * 1000),
+	},
 	seconds: {
 		toMilliseconds: 1000,
 	},
@@ -166,6 +172,8 @@ export const ARTIFICIAL_TASK_DATA = {
 	],
 };
 
+/** Lowest priority, meaning shut down happens after other groups */
 export const LOWEST_SHUTDOWN_PRIORITY = 0;
 export const DEFAULT_SHUTDOWN_PRIORITY = 100;
+/** Highest priority, meaning shut down happens before all other groups */
 export const HIGHEST_SHUTDOWN_PRIORITY = 200;
