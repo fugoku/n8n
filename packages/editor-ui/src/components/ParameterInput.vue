@@ -523,7 +523,7 @@ const isHtmlNode = computed(() => !!node.value && node.value.type === HTML_NODE_
 const isInputTypeString = computed(() => props.parameter.type === 'string');
 const isInputTypeNumber = computed(() => props.parameter.type === 'number');
 
-const isInputDataEmpty = computed(() => ndvStore.isNDVDataEmpty('input'));
+const isInputDataEmpty = computed(() => ndvStore.isInputPanelEmpty);
 const isDropDisabled = computed(
 	() =>
 		props.parameter.noDataExpression ||
@@ -983,7 +983,7 @@ watch(remoteParameterOptionsLoading, () => {
 
 // Focus input field when changing from fixed value to expression
 watch(isModelValueExpression, async (isExpression, wasExpression) => {
-	if (isExpression && !wasExpression) {
+	if (!props.isReadOnly && isExpression && !wasExpression) {
 		await nextTick();
 		inputField.value?.focus();
 	}
@@ -1023,7 +1023,7 @@ onUpdated(async () => {
 			@update:model-value="expressionUpdated"
 		></ExpressionEditModal>
 
-		<div class="parameter-input ignore-key-press" :style="parameterInputWrapperStyle">
+		<div class="parameter-input ignore-key-press-canvas" :style="parameterInputWrapperStyle">
 			<ResourceLocator
 				v-if="parameter.type === 'resourceLocator'"
 				ref="resourceLocator"
@@ -1092,13 +1092,16 @@ onUpdated(async () => {
 					:model-value="codeEditDialogVisible"
 					:append-to="`#${APP_MODALS_ELEMENT_ID}`"
 					width="80%"
-					:title="`${i18n.baseText('codeEdit.edit')} ${$locale
+					:title="`${i18n.baseText('codeEdit.edit')} ${i18n
 						.nodeText()
 						.inputLabelDisplayName(parameter, path)}`"
 					:before-close="closeCodeEditDialog"
 					data-test-id="code-editor-fullscreen"
 				>
-					<div :key="codeEditDialogVisible.toString()" class="ignore-key-press code-edit-dialog">
+					<div
+						:key="codeEditDialogVisible.toString()"
+						class="ignore-key-press-canvas code-edit-dialog"
+					>
 						<CodeNodeEditor
 							v-if="editorType === 'codeNodeEditor'"
 							:mode="codeEditorMode"
@@ -1178,7 +1181,7 @@ onUpdated(async () => {
 							icon="external-link-alt"
 							size="xsmall"
 							class="textarea-modal-opener"
-							:title="$locale.baseText('parameterInput.openEditWindow')"
+							:title="i18n.baseText('parameterInput.openEditWindow')"
 							@click="displayEditDialog()"
 						/>
 					</template>
@@ -1200,7 +1203,7 @@ onUpdated(async () => {
 							icon="external-link-alt"
 							size="xsmall"
 							class="textarea-modal-opener"
-							:title="$locale.baseText('parameterInput.openEditWindow')"
+							:title="i18n.baseText('parameterInput.openEditWindow')"
 							@click="displayEditDialog()"
 						/>
 					</template>
@@ -1221,7 +1224,7 @@ onUpdated(async () => {
 							icon="external-link-alt"
 							size="xsmall"
 							class="textarea-modal-opener"
-							:title="$locale.baseText('parameterInput.openEditWindow')"
+							:title="i18n.baseText('parameterInput.openEditWindow')"
 							@click="displayEditDialog()"
 						/>
 					</template>
@@ -1243,7 +1246,7 @@ onUpdated(async () => {
 							icon="external-link-alt"
 							size="xsmall"
 							class="textarea-modal-opener"
-							:title="$locale.baseText('parameterInput.openEditWindow')"
+							:title="i18n.baseText('parameterInput.openEditWindow')"
 							@click="displayEditDialog()"
 						/>
 					</template>
@@ -1263,7 +1266,7 @@ onUpdated(async () => {
 							icon="external-link-alt"
 							size="xsmall"
 							class="textarea-modal-opener"
-							:title="$locale.baseText('parameterInput.openEditWindow')"
+							:title="i18n.baseText('parameterInput.openEditWindow')"
 							@click="displayEditDialog()"
 						/>
 					</template>
@@ -1494,7 +1497,7 @@ onUpdated(async () => {
 				:disabled="isReadOnly"
 				@update:model-value="valueChanged"
 			/>
-			<div v-if="showDragnDropTip" :class="$style.tip">
+			<div v-if="!isReadOnly && showDragnDropTip" :class="$style.tip">
 				<InlineExpressionTip />
 			</div>
 		</div>
