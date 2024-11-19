@@ -1,14 +1,14 @@
 {
   "name": "n8n-nodes-base",
-  "version": "1.67.0",
+  "version": "1.68.0",
   "description": "Base nodes of n8n",
   "main": "index.js",
   "scripts": {
     "clean": "rimraf dist .turbo",
-    "dev": "pnpm watch",
+    "dev": "node init && pnpm watch",
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json && pnpm n8n-copy-icons && pnpm n8n-generate-translations && pnpm build:metadata",
-    "build:metadata": "pnpm n8n-generate-known && pnpm n8n-generate-ui-types",
+    "build": "node init && tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json && pnpm n8n-copy-icons && pnpm n8n-generate-translations && pnpm build:metadata",
+    "build:metadata": "node init && pnpm n8n-generate-known && pnpm n8n-generate-ui-types",
     "format": "biome format --write .",
     "format:check": "biome ci .",
     "lint": "eslint . --quiet && node ./scripts/validate-load-options-methods.js",

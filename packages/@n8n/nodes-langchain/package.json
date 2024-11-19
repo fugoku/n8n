@@ -1,14 +1,14 @@
 {
   "name": "@n8n/n8n-nodes-langchain",
-  "version": "1.67.0",
+  "version": "1.68.0",
   "description": "",
   "main": "index.js",
   "scripts": {
     "clean": "rimraf dist .turbo",
-    "dev": "pnpm run watch",
+    "dev": "node init && pnpm run watch",
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json && pnpm n8n-copy-icons && pnpm build:metadata",
-    "build:metadata": "pnpm n8n-generate-known && pnpm n8n-generate-ui-types",
+    "build": "node init && tsc -p tsconfig.build.json && pnpm n8n-copy-icons && pnpm build:metadata",
+    "build:metadata": "node init && pnpm n8n-generate-known && pnpm n8n-generate-ui-types",
     "format": "biome format --write .",
     "format:check": "biome ci .",
     "lint": "eslint nodes credentials --quiet",

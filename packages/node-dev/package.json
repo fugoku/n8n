@@ -1,6 +1,6 @@
 {
   "name": "n8n-node-dev",
-  "version": "1.67.0",
+  "version": "1.68.0",
   "description": "CLI to simplify n8n credentials/node development",
   "main": "dist/src/index",
   "types": "dist/src/index.d.ts",
@@ -10,9 +10,9 @@
   },
   "scripts": {
     "clean": "rimraf dist .turbo",
-    "dev": "pnpm watch",
-    "build": "tsc --noEmit",
-    "build-node-dev": "tsc",
+    "dev": "node init && pnpm watch",
+    "build": "node init && tsc --noEmit",
+    "build-node-dev": "node init && tsc",
     "format": "biome format --write .",
     "format:check": "biome ci .",
     "lint": "eslint . --quiet",
